@@ -4,11 +4,12 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
+use crate::graph_builder::GraphBackend;
 use crate::store::duckdb::{AnalysisRun, CodeDependency, CodeSymbol as DuckCodeSymbol, DuckStore};
-use crate::store::graph::{EdgeKind, GraphEdge, GraphNode, GraphStoreBackend, NodeKind};
 
 // Import Infiniloom types
 use infiniloom_engine::index::builder::IndexBuilder;
@@ -24,6 +25,7 @@ pub struct CodeAnalyzer {
 }
 
 /// Result of a code analysis operation
+#[derive(Debug)]
 pub struct AnalysisResult {
     pub files_analyzed: usize,
     pub symbols_extracted: usize,
@@ -44,7 +46,7 @@ impl CodeAnalyzer {
     pub fn analyze(
         &self,
         store: &DuckStore,
-        graph_store: &impl GraphStoreBackend,
+        graph_store: &impl GraphBackend,
     ) -> Result<AnalysisResult> {
         let start = Instant::now();
 
@@ -223,7 +225,7 @@ impl CodeAnalyzer {
         &self,
         index: &SymbolIndex,
         dep_graph: &DepGraph,
-        graph_store: &impl GraphStoreBackend,
+        graph_store: &impl GraphBackend,
     ) -> Result<(usize, usize)> {
         let mut nodes_added = 0;
         let mut edges_added = 0;
@@ -257,20 +259,18 @@ impl CodeAnalyzer {
                 properties.insert("docstring".to_string(), doc.clone());
             }
 
-            let node = GraphNode {
-                id: node_id.clone(),
-                kind: NodeKind::Symbol,
-                name: symbol.name.clone(),
-                properties,
-            };
-
-            graph_store.add_node(&node)?;
+            graph_store.add_node(
+                &node_id,
+                "Symbol",
+                &symbol.name,
+                &serde_json::to_string(&properties).unwrap_or_else(|_| "{}".to_string()),
+            )?;
             nodes_added += 1;
         }
 
         // Create CodeEntity nodes for each file
         for file in &index.files {
-            let node_id = format!("file:{}", file.path);
+            let node_id = format!("file:{}:{}", self.project_id, file.path);
 
             let mut properties = std::collections::HashMap::new();
             properties.insert("path".to_string(), file.path.clone());
@@ -278,14 +278,12 @@ impl CodeAnalyzer {
             properties.insert("lines".to_string(), file.lines.to_string());
             properties.insert("tokens".to_string(), file.tokens.to_string());
 
-            let node = GraphNode {
-                id: node_id.clone(),
-                kind: NodeKind::CodeEntity,
-                name: file.path.clone(),
-                properties,
-            };
-
-            graph_store.add_node(&node)?;
+            graph_store.add_node(
+                &node_id,
+                "CodeEntity",
+                &file.path,
+                &serde_json::to_string(&properties).unwrap_or_else(|_| "{}".to_string()),
+            )?;
             nodes_added += 1;
 
             // Create Defines edges from file to symbols
@@ -296,14 +294,7 @@ impl CodeAnalyzer {
                         self.project_id, file.path, symbol.name, symbol.span.start_line
                     );
 
-                    let edge = GraphEdge {
-                        from_id: node_id.clone(),
-                        to_id: symbol_id,
-                        kind: EdgeKind::Defines,
-                        properties: std::collections::HashMap::new(),
-                    };
-
-                    graph_store.add_edge(&edge)?;
+                    graph_store.add_edge(&node_id, &symbol_id, "DEFINES", "{}")?;
                     edges_added += 1;
                 }
             }
@@ -332,14 +323,7 @@ impl CodeAnalyzer {
                     self.project_id, callee_file.path, callee.name, callee.span.start_line
                 );
 
-                let edge = GraphEdge {
-                    from_id: caller_node_id,
-                    to_id: callee_node_id,
-                    kind: EdgeKind::Calls,
-                    properties: std::collections::HashMap::new(),
-                };
-
-                graph_store.add_edge(&edge)?;
+                graph_store.add_edge(&caller_node_id, &callee_node_id, "CALLS", "{}")?;
                 edges_added += 1;
             }
         }
@@ -350,17 +334,10 @@ impl CodeAnalyzer {
                 index.get_file_by_id(*from_file_id),
                 index.get_file_by_id(*to_file_id),
             ) {
-                let from_node_id = format!("file:{}", from_file.path);
-                let to_node_id = format!("file:{}", to_file.path);
+                let from_node_id = format!("file:{}:{}", self.project_id, from_file.path);
+                let to_node_id = format!("file:{}:{}", self.project_id, to_file.path);
 
-                let edge = GraphEdge {
-                    from_id: from_node_id,
-                    to_id: to_node_id,
-                    kind: EdgeKind::DependsOn,
-                    properties: std::collections::HashMap::new(),
-                };
-
-                graph_store.add_edge(&edge)?;
+                graph_store.add_edge(&from_node_id, &to_node_id, "DEPENDS_ON", "{}")?;
                 edges_added += 1;
             }
         }
@@ -379,7 +356,7 @@ impl CodeAnalyzer {
     ) -> Result<()> {
         let run = AnalysisRun {
             project_id: self.project_id.clone(),
-            commit_hash: None, // TODO: extract from git
+            commit_hash: self.current_commit_hash(),
             files_analyzed: index.files.len() as i32,
             symbols_extracted: symbols_extracted as i32,
             dependencies_found: dependencies_found as i32,
@@ -396,15 +373,85 @@ impl CodeAnalyzer {
         );
         Ok(())
     }
+
+    /// Return the repository's current Git commit, if it is a Git worktree.
+    fn current_commit_hash(&self) -> Option<String> {
+        let output = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&self.repo_path)
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+
+        let commit = String::from_utf8(output.stdout).ok()?.trim().to_string();
+        (commit.len() == 40 || commit.len() == 64)
+            .then_some(commit)
+            .filter(|commit| commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph_builder::GraphBuilder;
+    use crate::store::DuckStore;
 
     #[test]
     fn test_analyzer_creation() {
         let analyzer = CodeAnalyzer::new("test-project", "/tmp/test");
         assert_eq!(analyzer.project_id, "test-project");
+    }
+
+    #[test]
+    fn test_commit_hash_handles_git_and_non_git_repositories() {
+        let outside_git = tempfile::tempdir().expect("non-git directory");
+        let non_git = CodeAnalyzer::new("non-git", outside_git.path());
+        assert_eq!(non_git.current_commit_hash(), None);
+
+        let repository_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let git = CodeAnalyzer::new("git", &repository_root);
+        let commit = git.current_commit_hash().expect("repository commit");
+        assert!(
+            commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+                && (commit.len() == 40 || commit.len() == 64),
+            "unexpected commit: {commit}"
+        );
+    }
+
+    #[test]
+    fn test_analyze_persists_symbols_and_graph() {
+        let repository = tempfile::tempdir().expect("temporary repository");
+        std::fs::write(
+            repository.path().join("lib.rs"),
+            r#"
+                pub fn alpha() -> usize { 1 }
+                pub fn beta() -> usize { alpha() }
+            "#,
+        )
+        .expect("write Rust fixture");
+
+        let store = DuckStore::open_in_memory().expect("open DuckStore");
+        let graph = GraphBuilder::with_backend(&store);
+        let analyzer = CodeAnalyzer::new("graph-e2e", repository.path());
+        let result = analyzer
+            .analyze(&store, graph.backend())
+            .expect("analyze repository");
+
+        assert_eq!(result.files_analyzed, 1);
+        assert!(result.symbols_extracted >= 2, "result: {result:?}");
+        assert!(
+            graph.node_count() >= 3,
+            "file plus symbols should be persisted"
+        );
+        assert!(graph.edge_count() >= 2);
+        assert!(
+            store
+                .get_symbols_for_project("graph-e2e", 100)
+                .expect("read symbols")
+                .len()
+                >= 2
+        );
     }
 }

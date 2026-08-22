@@ -7,7 +7,6 @@ use chrono::{NaiveDateTime, Utc};
 use remembrant_engine::embedding::MockEmbedder;
 use remembrant_engine::graph_builder::GraphBuilder;
 use remembrant_engine::store::duckdb::{Decision, DuckStore, Memory, Session, ToolCall};
-use remembrant_engine::store::graph::NodeKind;
 use remembrant_engine::store::lance::LanceStore;
 use remembrant_engine::{EmbedChunk, EmbedPipeline, Granularity};
 use tempfile::tempdir;
@@ -181,7 +180,7 @@ fn test_graph_builder_from_sessions() -> Result<()> {
         node_count >= 3,
         "Expected at least 3 nodes (2 sessions + 1 memory)"
     );
-    assert!(edge_count >= 0, "Expected at least 0 edges");
+    assert!(edge_count > 0, "Expected graph builder to create edges");
 
     // Graph building completed successfully
 
@@ -240,7 +239,8 @@ async fn test_embed_pipeline_with_mock() -> Result<()> {
     // Create embed chunks manually
     let chunks = vec![
         EmbedChunk {
-            id: Uuid::new_v4().to_string(),
+            id: "integration-session-embedding".to_string(),
+            source_id: Some(session1.id.clone()),
             content: session1.summary.clone().unwrap(),
             granularity: Granularity::Session,
             project_id: session1.project_id.clone(),
@@ -249,7 +249,8 @@ async fn test_embed_pipeline_with_mock() -> Result<()> {
             language: None,
         },
         EmbedChunk {
-            id: Uuid::new_v4().to_string(),
+            id: "integration-memory-embedding".to_string(),
+            source_id: Some(memory1.id.clone()),
             content: memory1.content.clone(),
             granularity: Granularity::Memory,
             project_id: memory1.project_id.clone(),

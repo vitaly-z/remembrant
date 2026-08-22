@@ -17,6 +17,9 @@ use crate::store::duckdb::{Decision, Fact, Memory, Session};
 ///
 /// Works out-of-the-box with LM Studio (localhost:1234) and can be pointed
 /// at any compatible endpoint (OpenAI, Ollama, vLLM, etc.).
+const LLM_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const LLM_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 pub struct LlmClient {
     base_url: String,
     model: String,
@@ -63,7 +66,11 @@ impl LlmClient {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             model: model.to_string(),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(LLM_CONNECT_TIMEOUT)
+                .timeout(LLM_REQUEST_TIMEOUT)
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
@@ -347,12 +354,8 @@ impl Distiller {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no LLM client configured"))?;
 
-        // Truncate for local models (max ~4000 chars).
-        let truncated = if text.len() > 4000 {
-            &text[..4000]
-        } else {
-            text
-        };
+        // Truncate for local models (max 4000 Unicode scalar values).
+        let truncated: String = text.chars().take(4000).collect();
 
         let system_prompt = "You are a knowledge extraction assistant. Analyze coding agent \
              transcripts and extract structured knowledge. Respond ONLY with valid JSON.";
@@ -387,7 +390,7 @@ impl Distiller {
         let extraction: LlmExtraction = serde_json::from_str(json_str).with_context(|| {
             format!(
                 "failed to parse LLM JSON response: {}",
-                &raw[..raw.len().min(200)]
+                raw.chars().take(200).collect::<String>()
             )
         })?;
 
@@ -867,15 +870,28 @@ fn looks_like_tool_output(line: &str) -> bool {
 /// Truncate a string at the first sentence boundary or at `max_len`.
 fn truncate_at_sentence(text: &str, max_len: usize) -> String {
     let text = text.trim();
-    if text.len() <= max_len {
+    if text.chars().count() <= max_len {
         return text.to_string();
     }
-    // Find the first sentence-ending punctuation within max_len.
-    if let Some(pos) = text[..max_len].rfind(['.', '!', '?']) {
-        text[..=pos].to_string()
-    } else {
-        format!("{}...", &text[..max_len.saturating_sub(3)])
+
+    let prefix: String = text.chars().take(max_len).collect();
+    // Find the last sentence-ending punctuation within the prefix.
+    let sentence = prefix
+        .char_indices()
+        .rev()
+        .find(|(_, character)| matches!(character, '.' | '!' | '?'))
+        .map(|(pos, character)| &prefix[..pos + character.len_utf8()]);
+    if let Some(sentence) = sentence {
+        return sentence.to_string();
     }
+
+    let keep = max_len.saturating_sub(3);
+    if keep == 0 {
+        return "...".to_string();
+    }
+
+    let truncated: String = prefix.chars().take(keep).collect();
+    format!("{truncated}...")
 }
 
 // ---------------------------------------------------------------------------
@@ -1002,7 +1018,6 @@ mod tests {
             level: DistillationLevel::None,
             llm_provider: String::new(),
             llm_model: String::new(),
-            api_key_env: String::new(),
         };
         let distiller = Distiller::new(&config);
         let session = make_session("s-none");
@@ -1123,6 +1138,19 @@ mod tests {
 
         let with_plain_fences = "```\n{\"key\": \"value\"}\n```";
         assert_eq!(strip_code_fences(with_plain_fences), "{\"key\": \"value\"}");
+    }
+
+    #[test]
+    fn test_truncate_at_sentence_is_unicode_safe() {
+        let text = "🔐".repeat(300);
+        let truncated = truncate_at_sentence(&text, 200);
+        assert_eq!(truncated.chars().count(), 200);
+        assert!(truncated.ends_with("..."));
+
+        assert_eq!(
+            truncate_at_sentence("Unicode boundary. More text", 18),
+            "Unicode boundary."
+        );
     }
 
     #[test]

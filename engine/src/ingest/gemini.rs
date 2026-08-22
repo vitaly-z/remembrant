@@ -376,8 +376,9 @@ impl GeminiIngester {
                 .and_then(|m| m.content.first_text())
                 .map(|t| {
                     let trimmed = t.trim();
-                    if trimmed.len() > 200 {
-                        format!("{}...", &trimmed[..200])
+                    if trimmed.chars().count() > 200 {
+                        let truncated: String = trimmed.chars().take(197).collect();
+                        format!("{truncated}...")
                     } else {
                         trimmed.to_string()
                     }

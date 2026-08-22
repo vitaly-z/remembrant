@@ -306,7 +306,7 @@ impl<'a> TreeBuilder<'a> {
 
     /// Build the root node with project children (level 1 only).
     pub fn build_root(&self) -> Result<TreeNode> {
-        let mut root = TreeNode::new("root", TreeNodeType::Root, "Remembrant");
+        let mut root = TreeNode::new("Root", TreeNodeType::Root, "Remembrant");
         root.text_repr = "Remembrant Memory Store".to_string();
 
         let project_ids = self.store.get_project_ids()?;
@@ -375,7 +375,7 @@ impl<'a> TreeBuilder<'a> {
     /// Parses the node ID prefix to determine type (e.g., "project:", "session:")
     /// and queries accordingly.
     pub fn find_node(&self, node_id: &str) -> Result<Option<TreeNode>> {
-        if node_id == "root" {
+        if node_id.eq_ignore_ascii_case("root") {
             let root = self.build_root()?;
             return Ok(Some(root));
         }
@@ -1366,9 +1366,14 @@ mod tests {
         let store = setup_test_store();
         let builder = TreeBuilder::new(&store);
 
-        let node = builder.find_node("root").unwrap();
+        let node = builder.find_node("Root").unwrap();
         assert!(node.is_some());
-        assert_eq!(node.unwrap().node_type, TreeNodeType::Root);
+        let node = node.unwrap();
+        assert_eq!(node.node_type, TreeNodeType::Root);
+        assert_eq!(node.id, "Root");
+
+        // Lookup is case-insensitive for the root node.
+        assert!(builder.find_node("root").unwrap().is_some());
     }
 
     #[test]

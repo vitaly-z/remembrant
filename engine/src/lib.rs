@@ -25,7 +25,7 @@ pub use consolidate::{
     ConsolidationStats, DecayScore, MergeCandidate, compute_decay_scores, consolidate,
 };
 pub use context::{AgentContext, ContextAssembler, PressureLevel};
-pub use detect::{AgentDetection, AgentInfo, detect_agents};
+pub use detect::{AgentDetection, AgentInfo, detect_agents, detect_agents_from};
 pub use distill::{DistilledSession, Distiller, LlmClient};
 pub use embed_pipeline::{EmbedChunk, EmbedPipeline, EmbedStats, Granularity};
 pub use embedding::{EmbedProvider, LmStudioEmbedder, MockEmbedder, batch_embed};

@@ -13,7 +13,7 @@ description = "Shared persistent memory for coding agents"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+serde_norway = "0.9"
 
 # Async
 tokio = { version = "1", features = ["full"] }
@@ -44,7 +44,6 @@ futures = "0.3"
 
 # Databases
 duckdb = { version = "1", features = ["bundled", "chrono"] }
-# kuzu = "0.11"  # TODO: re-enable when Rust SDK stabilizes
 lancedb = "0.27"
 
 # File watching
@@ -59,6 +58,7 @@ reqwest = { version = "0.12", features = ["json"] }
 
 # Regex
 regex = "1"
+glob = "0.3"
 
 # Directories
 dirs = "6"
@@ -68,4 +68,3 @@ rusqlite = { version = "0.34", features = ["bundled"] }
 
 # Web server
 axum = "0.8"
-tower-http = { version = "0.6", features = ["cors"] }
