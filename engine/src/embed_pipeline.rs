@@ -1,8 +1,8 @@
 use std::fmt;
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 use crate::embedding::EmbedProvider;
 use crate::store::duckdb::{Memory, Session, ToolCall};
@@ -51,12 +51,35 @@ impl fmt::Display for Granularity {
 #[derive(Debug, Clone)]
 pub struct EmbedChunk {
     pub id: String,
+    pub source_id: Option<String>,
     pub content: String,
     pub granularity: Granularity,
     pub project_id: Option<String>,
     pub session_id: Option<String>,
     pub file_path: Option<String>,
     pub language: Option<String>,
+}
+
+/// Build a deterministic embedding ID from the chunk's source and content.
+fn stable_embedding_id(chunk: &EmbedChunk) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(chunk.granularity.to_string().as_bytes());
+    hasher.update([0]);
+    hasher.update(chunk.source_id.as_deref().unwrap_or("").as_bytes());
+    hasher.update([0]);
+    hasher.update(chunk.session_id.as_deref().unwrap_or("").as_bytes());
+    hasher.update([0]);
+    hasher.update(chunk.file_path.as_deref().unwrap_or("").as_bytes());
+    hasher.update([0]);
+    hasher.update(chunk.content.as_bytes());
+    let digest = hasher.finalize();
+    format!(
+        "embed-{}",
+        digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -136,15 +159,18 @@ impl EmbedPipeline {
             );
 
             if !content.trim().is_empty() {
-                chunks.push(EmbedChunk {
-                    id: Uuid::new_v4().to_string(),
+                let mut chunk = EmbedChunk {
+                    id: String::new(),
+                    source_id: Some(session.id.clone()),
                     content,
                     granularity: Granularity::Session,
                     project_id: session.project_id.clone(),
                     session_id: Some(session.id.clone()),
                     file_path: None,
                     language: None,
-                });
+                };
+                chunk.id = stable_embedding_id(&chunk);
+                chunks.push(chunk);
             }
 
             // One CodeChange chunk per changed file
@@ -153,15 +179,18 @@ impl EmbedPipeline {
                     "File changed: {file}\nSession: {summary}\nAgent: {agent}",
                     agent = session.agent,
                 );
-                chunks.push(EmbedChunk {
-                    id: Uuid::new_v4().to_string(),
+                let mut chunk = EmbedChunk {
+                    id: String::new(),
+                    source_id: Some(format!("{}\u{0}{file}", session.id)),
                     content,
                     granularity: Granularity::CodeChange,
                     project_id: session.project_id.clone(),
                     session_id: Some(session.id.clone()),
                     file_path: Some(file.clone()),
                     language: None,
-                });
+                };
+                chunk.id = stable_embedding_id(&chunk);
+                chunks.push(chunk);
             }
         }
 
@@ -176,15 +205,18 @@ impl EmbedPipeline {
             .map(|m| {
                 let mem_type = m.memory_type.as_deref().unwrap_or("general");
                 let content = format!("[{mem_type}] {}", m.content);
-                EmbedChunk {
-                    id: Uuid::new_v4().to_string(),
+                let mut chunk = EmbedChunk {
+                    id: String::new(),
+                    source_id: Some(m.id.clone()),
                     content,
                     granularity: Granularity::Memory,
                     project_id: m.project_id.clone(),
                     session_id: m.source_session_id.clone(),
                     file_path: None,
                     language: None,
-                }
+                };
+                chunk.id = stable_embedding_id(&chunk);
+                chunk
             })
             .collect()
     }
@@ -198,15 +230,18 @@ impl EmbedPipeline {
                 let tool_name = tc.tool_name.as_deref().unwrap_or("unknown");
                 let command = tc.command.as_deref().unwrap_or("");
                 let content = format!("Tool: {tool_name}\nCommand: {command}");
-                EmbedChunk {
-                    id: Uuid::new_v4().to_string(),
+                let mut chunk = EmbedChunk {
+                    id: String::new(),
+                    source_id: Some(tc.id.clone()),
                     content,
                     granularity: Granularity::ToolCall,
                     project_id: None,
                     session_id: tc.session_id.clone(),
                     file_path: None,
                     language: None,
-                }
+                };
+                chunk.id = stable_embedding_id(&chunk);
+                chunk
             })
             .collect()
     }
@@ -404,6 +439,12 @@ mod tests {
         ];
 
         let chunks = EmbedPipeline::extract_session_chunks(&sessions);
+        let rerun = EmbedPipeline::extract_session_chunks(&sessions);
+        assert_eq!(
+            chunks.iter().map(|chunk| &chunk.id).collect::<Vec<_>>(),
+            rerun.iter().map(|chunk| &chunk.id).collect::<Vec<_>>()
+        );
+        assert!(chunks.iter().all(|chunk| chunk.id.starts_with("embed-")));
 
         // s-1: 1 session chunk + 2 code-change chunks = 3
         // s-2: 1 session chunk + 1 code-change chunk  = 2
@@ -446,6 +487,11 @@ mod tests {
         ];
 
         let chunks = EmbedPipeline::extract_memory_chunks(&memories);
+        let rerun = EmbedPipeline::extract_memory_chunks(&memories);
+        assert_eq!(
+            chunks.iter().map(|chunk| &chunk.id).collect::<Vec<_>>(),
+            rerun.iter().map(|chunk| &chunk.id).collect::<Vec<_>>()
+        );
 
         assert_eq!(chunks.len(), 2); // empty one skipped
         assert!(chunks[0].content.starts_with("[insight]"));
@@ -462,6 +508,11 @@ mod tests {
         ];
 
         let chunks = EmbedPipeline::extract_tool_call_chunks(&tool_calls);
+        let rerun = EmbedPipeline::extract_tool_call_chunks(&tool_calls);
+        assert_eq!(
+            chunks.iter().map(|chunk| &chunk.id).collect::<Vec<_>>(),
+            rerun.iter().map(|chunk| &chunk.id).collect::<Vec<_>>()
+        );
         assert_eq!(chunks.len(), 2);
         assert!(chunks[0].content.contains("Tool: bash"));
         assert!(chunks[0].content.contains("Command: cargo build"));
@@ -501,6 +552,31 @@ mod tests {
         assert_eq!(stats.chunks_embedded, 4);
         assert_eq!(stats.chunks_stored, 4);
         assert_eq!(stats.errors, 0);
+
+        let rerun = pipeline
+            .run(&sessions, &memories, &tool_calls, &embedder)
+            .await
+            .expect("pipeline rerun");
+        assert_eq!(rerun.chunks_stored, 4);
+        let query = vec![0.0; dim as usize];
+        assert_eq!(
+            pipeline
+                .lance_store
+                .search_code(&query, 10)
+                .await
+                .expect("search code embeddings")
+                .len(),
+            3
+        );
+        assert_eq!(
+            pipeline
+                .lance_store
+                .search_memories(&query, 10)
+                .await
+                .expect("search memory embeddings")
+                .len(),
+            1
+        );
     }
 
     #[test]

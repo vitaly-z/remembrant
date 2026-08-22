@@ -8,7 +8,7 @@ description = "Core engine for Remembrant: ingestion, storage, search, and graph
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
+serde_norway.workspace = true
 tokio.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true
@@ -18,7 +18,6 @@ tracing.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 duckdb.workspace = true
-# kuzu.workspace = true  # TODO: re-enable when Rust SDK stabilizes
 lancedb.workspace = true
 futures.workspace = true
 notify.workspace = true
@@ -26,6 +25,7 @@ notify-debouncer-mini.workspace = true
 sha2.workspace = true
 reqwest.workspace = true
 regex.workspace = true
+glob.workspace = true
 dirs.workspace = true
 rusqlite = { workspace = true, optional = true }
 infiniloom-engine = { path = "../../infiniloom/engine", optional = true }

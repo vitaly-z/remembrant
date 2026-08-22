@@ -58,6 +58,14 @@ impl IngestPipeline {
     pub fn ingest_claude(&self) -> Result<IngestResult> {
         info!("starting Claude Code ingestion");
         let ingester = ClaudeIngester::new()?;
+        self.ingest_claude_from(&ingester)
+    }
+
+    /// Ingest Claude Code artifacts from an explicit ingester.
+    ///
+    /// This dependency-injection point keeps tests isolated from the current
+    /// user's real `~/.claude` directory.
+    pub fn ingest_claude_from(&self, ingester: &ClaudeIngester) -> Result<IngestResult> {
         let data = ingester.ingest_all()?;
 
         let mut result = IngestResult::new("claude_code");
@@ -104,6 +112,11 @@ impl IngestPipeline {
                 return Ok(IngestResult::new("codex"));
             }
         };
+        self.ingest_codex_from(&ingester)
+    }
+
+    /// Ingest Codex artifacts from an explicit ingester.
+    pub fn ingest_codex_from(&self, ingester: &CodexIngester) -> Result<IngestResult> {
         let data = ingester.ingest_all()?;
 
         let mut result = IngestResult::new("codex");
@@ -147,6 +160,11 @@ impl IngestPipeline {
                 return Ok(IngestResult::new("gemini"));
             }
         };
+        self.ingest_gemini_from(&ingester)
+    }
+
+    /// Ingest Gemini artifacts from an explicit ingester.
+    pub fn ingest_gemini_from(&self, ingester: &GeminiIngester) -> Result<IngestResult> {
         let (mut result, sessions, tool_calls, memories) = ingester.ingest_all();
 
         for session in &sessions {
@@ -186,18 +204,31 @@ mod tests {
 
     #[test]
     fn test_pipeline_handles_empty_gracefully() {
-        // In-memory DuckDB, no agent dirs exist -> should return Ok with
-        // empty or zero results, not crash.
+        use tempfile::TempDir;
+
+        // In-memory DuckDB plus explicitly empty agent roots. Tests must never
+        // read (or, worse, ingest) the developer's real multi-gigabyte agent
+        // history just to exercise the empty path.
+        let home = TempDir::new().expect("create isolated agent root");
         let store = DuckStore::open_in_memory().expect("open in-memory DuckDB");
         let pipeline = IngestPipeline::new(store);
-        let results = pipeline
-            .run_full_ingest()
-            .expect("full ingest should not fail");
+        let claude = pipeline
+            .ingest_claude_from(&ClaudeIngester::with_base_path(home.path().join(".claude")))
+            .expect("empty Claude ingest");
+        let codex = pipeline
+            .ingest_codex_from(&CodexIngester::with_base_path(home.path().join(".codex")))
+            .expect("empty Codex ingest");
+        let gemini = pipeline
+            .ingest_gemini_from(&GeminiIngester::with_base_path(home.path().join(".gemini")))
+            .expect("empty Gemini ingest");
+        let results = [claude, codex, gemini];
 
         // Each agent either returns empty results or is skipped entirely.
-        for r in &results {
-            assert!(r.errors.is_empty() || !r.errors.is_empty()); // doesn't panic
-        }
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| r.errors.is_empty()));
+        assert!(results.iter().all(|r| r.sessions_found == 0));
+        assert!(results.iter().all(|r| r.tool_calls_found == 0));
+        assert!(results.iter().all(|r| r.memories_found == 0));
     }
 
     #[test]
@@ -268,7 +299,9 @@ mod tests {
         assert_eq!(sessions[0].summary.as_deref(), Some("updated summary"));
 
         let memories = store.search_memories("important").expect("search memories");
-        assert_eq!(memories.len(), 1);
-        assert_eq!(memories[0].id, "mem-1");
+        assert!(
+            memories.is_empty(),
+            "replacing a session must remove its old derived memories"
+        );
     }
 }

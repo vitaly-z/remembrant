@@ -32,20 +32,27 @@ pub fn detect_agents() -> AgentDetection {
         return AgentDetection::default();
     };
 
+    detect_agents_from(&home)
+}
+
+/// Scan for known agents beneath an explicit home-like root.
+///
+/// Tests use this form so verification never traverses the developer's real
+/// agent transcript directories.
+pub fn detect_agents_from(home: &Path) -> AgentDetection {
     AgentDetection {
-        claude_code: detect_claude_code(&home),
-        codex: detect_codex(&home),
-        gemini: detect_gemini(&home),
+        claude_code: detect_claude_code(home),
+        codex: detect_codex(home),
+        gemini: detect_gemini(home),
     }
 }
 
 /// Resolve the user's home directory.
 fn home_dir() -> Option<PathBuf> {
-    // Prefer $HOME; fall back to std::env::home_dir (deprecated but still useful).
-    std::env::var_os("HOME").map(PathBuf::from).or_else(|| {
-        #[allow(deprecated)]
-        std::env::home_dir()
-    })
+    // Prefer $HOME; fall back to the platform home-directory resolver.
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
 }
 
 // ---------------------------------------------------------------------------
@@ -181,14 +188,7 @@ fn count_dirs(dir: &PathBuf) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn detect_agents_returns_without_panic() {
-        // Smoke test: must not panic regardless of what's on disk.
-        let detection = detect_agents();
-        // At minimum the struct should be constructable.
-        let _ = format!("{detection:?}");
-    }
+    use std::fs;
 
     #[test]
     fn default_detection_is_all_none() {
@@ -196,5 +196,29 @@ mod tests {
         assert!(d.claude_code.is_none());
         assert!(d.codex.is_none());
         assert!(d.gemini.is_none());
+    }
+
+    #[test]
+    fn detect_agents_from_uses_isolated_root() {
+        let home = tempfile::tempdir().expect("temporary home");
+        fs::create_dir_all(home.path().join(".claude/projects/project-a")).unwrap();
+        fs::create_dir_all(home.path().join(".codex/sessions/session-a")).unwrap();
+        fs::write(home.path().join(".codex/config.toml"), "").unwrap();
+        fs::create_dir_all(home.path().join(".gemini/tmp/project/chats")).unwrap();
+        fs::write(
+            home.path().join(".gemini/tmp/project/chats/session.json"),
+            "{}",
+        )
+        .unwrap();
+        fs::write(home.path().join(".gemini/projects.json"), "{}").unwrap();
+
+        let detection = detect_agents_from(home.path());
+        assert_eq!(detection.claude_code.expect("claude").session_count, 1);
+        let codex = detection.codex.expect("codex");
+        assert_eq!(codex.session_count, 1);
+        assert!(codex.config_found);
+        let gemini = detection.gemini.expect("gemini");
+        assert_eq!(gemini.session_count, 1);
+        assert!(gemini.config_found);
     }
 }

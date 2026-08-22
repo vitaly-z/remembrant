@@ -3,13 +3,15 @@
 //! These wrap the existing parser implementations behind the [`AgentAdapter`]
 //! trait so they can be used through the unified [`AdapterRegistry`].
 
-use anyhow::Result;
+use anyhow::{Result, bail};
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use super::adapter::{AgentAdapter, AgentMeta, IngestOutput, expand_tilde};
 use super::claude::ClaudeIngester;
 use super::codex::CodexIngester;
 use super::gemini::GeminiIngester;
+use crate::config::AppConfig;
 
 // ---------------------------------------------------------------------------
 // Claude Code adapter
@@ -178,6 +180,67 @@ pub fn build_default_registry() -> super::adapter::AdapterRegistry {
     registry
 }
 
+/// Build an adapter registry from user configuration.
+///
+/// Native paths and `enabled` flags are honoured, as are configured dynamic
+/// SQLite agents. Unsupported dynamic adapter types are rejected rather than
+/// being silently ignored.
+pub fn build_registry_from_config(config: &AppConfig) -> Result<super::adapter::AdapterRegistry> {
+    let mut registry = super::adapter::AdapterRegistry::new();
+    let mut configured_ids = HashSet::new();
+
+    if config.agents.claude_code.enabled {
+        configured_ids.insert("claude_code");
+        registry.register(Box::new(ClaudeAdapter::new(
+            &config.agents.claude_code.path,
+        )));
+    }
+    if config.agents.codex.enabled {
+        configured_ids.insert("codex");
+        registry.register(Box::new(CodexAdapter::new(&config.agents.codex.path)));
+    }
+    if config.agents.gemini.enabled {
+        configured_ids.insert("gemini");
+        registry.register(Box::new(GeminiAdapter::new(&config.agents.gemini.path)));
+    }
+
+    for agent in &config.agents.dynamic {
+        if !configured_ids.insert(agent.id.as_str()) {
+            bail!("duplicate agent id '{}'", agent.id);
+        }
+        if !agent.enabled {
+            continue;
+        }
+        match agent.adapter_type.as_str() {
+            "sqlite" => {
+                #[cfg(feature = "sqlite-adapters")]
+                {
+                    let adapter = super::sqlite_adapter::GenericSqliteAdapter::from_config(agent)
+                        .ok_or_else(|| {
+                        anyhow::anyhow!("dynamic agent '{}' is missing SQLite mappings", agent.id)
+                    })?;
+                    registry.register(Box::new(adapter));
+                }
+                #[cfg(not(feature = "sqlite-adapters"))]
+                bail!(
+                    "dynamic agent '{}' requires the sqlite-adapters feature",
+                    agent.id
+                );
+            }
+            "jsonl" => {
+                let adapter = super::jsonl_adapter::GenericJsonlAdapter::from_config(agent)?;
+                registry.register(Box::new(adapter));
+            }
+            other => bail!(
+                "unsupported adapter type '{other}' for agent '{}'",
+                agent.id
+            ),
+        }
+    }
+
+    Ok(registry)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -274,6 +337,110 @@ mod tests {
         assert!(reg.get("claude_code").is_some());
         assert!(reg.get("codex").is_some());
         assert!(reg.get("gemini").is_some());
+    }
+
+    #[test]
+    fn test_registry_from_config_honours_enabled_and_paths() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("projects")).unwrap();
+
+        let mut config = crate::config::AppConfig::default();
+        config.agents.claude_code.path = tmp.path().to_string_lossy().to_string();
+        config.agents.codex.enabled = false;
+        config.agents.gemini.enabled = false;
+
+        let registry = build_registry_from_config(&config).unwrap();
+        assert_eq!(registry.agent_ids(), vec!["claude_code"]);
+        assert_eq!(registry.detected_ids(), vec!["claude_code"]);
+    }
+
+    #[test]
+    fn test_registry_from_config_rejects_unknown_adapter() {
+        let mut config = crate::config::AppConfig::default();
+        config.agents.claude_code.enabled = false;
+        config.agents.codex.enabled = false;
+        config.agents.gemini.enabled = false;
+        config.agents.dynamic = vec![super::super::adapter::DynamicAgentConfig {
+            id: "unsupported".into(),
+            display_name: "Unsupported".into(),
+            enabled: true,
+            path: "/tmp/unsupported".into(),
+            adapter_type: "parquet".into(),
+            sqlite: None,
+            jsonl: None,
+        }];
+
+        let Err(error) = build_registry_from_config(&config) else {
+            panic!("unsupported dynamic adapter should be rejected");
+        };
+        assert!(error.to_string().contains("unsupported adapter type"));
+    }
+
+    #[test]
+    fn test_registry_from_config_rejects_duplicate_agent_ids() {
+        let mut config = crate::config::AppConfig::default();
+        config.agents.dynamic = vec![
+            super::super::adapter::DynamicAgentConfig {
+                id: "duplicate".into(),
+                display_name: "First".into(),
+                enabled: false,
+                path: "/tmp/first".into(),
+                adapter_type: "jsonl".into(),
+                sqlite: None,
+                jsonl: None,
+            },
+            super::super::adapter::DynamicAgentConfig {
+                id: "duplicate".into(),
+                display_name: "Second".into(),
+                enabled: false,
+                path: "/tmp/second".into(),
+                adapter_type: "jsonl".into(),
+                sqlite: None,
+                jsonl: None,
+            },
+        ];
+
+        let Err(error) = build_registry_from_config(&config) else {
+            panic!("duplicate agent IDs should be rejected");
+        };
+        assert!(error.to_string().contains("duplicate agent id 'duplicate'"));
+    }
+
+    #[test]
+    fn test_registry_from_config_builds_generic_jsonl_adapter() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("project")).unwrap();
+        fs::write(
+            tmp.path().join("project").join("session.jsonl"),
+            "{\"sessionId\":\"dynamic-1\",\"message\":{\"text\":\"hello\"}}\n",
+        )
+        .unwrap();
+
+        let mut config = crate::config::AppConfig::default();
+        config.agents.claude_code.enabled = false;
+        config.agents.codex.enabled = false;
+        config.agents.gemini.enabled = false;
+        config.agents.dynamic = vec![super::super::adapter::DynamicAgentConfig {
+            id: "custom_jsonl".into(),
+            display_name: "Custom JSONL".into(),
+            enabled: true,
+            path: tmp.path().to_string_lossy().to_string(),
+            adapter_type: "jsonl".into(),
+            sqlite: None,
+            jsonl: Some(super::super::adapter::JsonlMapping {
+                file_pattern: "**/*.jsonl".into(),
+                session_id_path: "sessionId".into(),
+                timestamp_path: None,
+                content_path: Some("message.text".into()),
+                tool_name_path: None,
+                tool_call_type: None,
+            }),
+        }];
+
+        let registry = build_registry_from_config(&config).unwrap();
+        assert_eq!(registry.detected_ids(), vec!["custom_jsonl"]);
+        let output = registry.ingest_agent("custom_jsonl").unwrap();
+        assert_eq!(output.session_count(), 1);
     }
 
     #[test]

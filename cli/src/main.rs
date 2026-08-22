@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -7,21 +8,19 @@ use axum::{
     Json as AxumJson, Router,
     extract::{Path as AxumPath, Query, State},
     http::StatusCode,
-    response::Html,
-    routing::{delete, get, post, put},
+    routing::{delete, get, post},
 };
-use chrono::NaiveDateTime;
+use chrono::{Datelike, NaiveDateTime};
 use clap::{Parser, Subcommand};
 mod mcp_server;
 
+use remembrant_engine::AppConfig;
 use remembrant_engine::distill::Distiller;
 use remembrant_engine::embed_pipeline::EmbedPipeline;
 use remembrant_engine::embedding::{EmbedProvider, LmStudioEmbedder};
 use remembrant_engine::graph_builder::{self, GraphBackend, GraphBuilder};
 use remembrant_engine::repo_embed::RepoEmbedder;
 use remembrant_engine::store::{DuckStore, LanceStore};
-use remembrant_engine::{AppConfig, ClaudeIngester, CodexIngester, GeminiIngester, detect_agents};
-use tower_http::cors::CorsLayer;
 
 #[derive(Parser)]
 #[command(
@@ -63,7 +62,7 @@ enum Commands {
         since: Option<String>,
 
         /// Filter by content type
-        #[arg(long, name = "type")]
+        #[arg(long = "type", alias = "content-type")]
         content_type: Option<String>,
 
         /// Use exact matching instead of semantic
@@ -339,6 +338,162 @@ fn pid_file_path() -> Result<PathBuf> {
     Ok(dir.join("daemon.pid"))
 }
 
+/// Return whether a Unix process is currently alive.
+#[cfg(unix)]
+fn process_is_running(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Process probing is not currently supported on non-Unix targets.
+#[cfg(not(unix))]
+fn process_is_running(_pid: u32) -> bool {
+    false
+}
+
+/// Reject an active watcher PID file and remove stale markers.
+fn ensure_no_active_pid_file(pid_path: &std::path::Path) -> Result<()> {
+    if !pid_path.exists() {
+        return Ok(());
+    }
+
+    let existing = std::fs::read_to_string(pid_path)
+        .with_context(|| format!("failed to read {}", pid_path.display()))?;
+    let existing = existing
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("invalid PID in {}: {existing}", pid_path.display()))?;
+    if process_is_running(existing) {
+        anyhow::bail!("watcher PID {existing} is already running; run `rem stop` first");
+    }
+
+    std::fs::remove_file(pid_path)
+        .with_context(|| format!("failed to remove stale {}", pid_path.display()))
+}
+
+/// Ingest only sessions whose normalized values changed.
+///
+/// Replacing a changed session atomically removes stale transcript-derived
+/// rows while preserving manual notes and decisions without a session source.
+fn ingest_watch_snapshot(
+    store: &DuckStore,
+    registry: &remembrant_engine::ingest::AdapterRegistry,
+    adapter_ids: Option<&HashSet<String>>,
+) -> Result<usize> {
+    let mut known: HashMap<String, _> = store
+        .get_recent_sessions(100_000)?
+        .into_iter()
+        .map(|session| (session.id.clone(), session))
+        .collect();
+    let mut ingested = 0;
+
+    for adapter in registry.detected() {
+        let meta = adapter.meta();
+        if adapter_ids.is_some_and(|ids| !ids.contains(&meta.id)) {
+            continue;
+        }
+
+        match adapter.ingest() {
+            Ok(result) => {
+                for error in result.errors {
+                    eprintln!("[watch] {} parse error: {error}", meta.display_name);
+                }
+
+                let mut changed_ids = HashSet::new();
+                for session in &result.sessions {
+                    let changed = known.get(&session.id).is_none_or(|previous| {
+                        previous.started_at != session.started_at
+                            || previous.ended_at != session.ended_at
+                            || previous.summary != session.summary
+                            || previous.message_count != session.message_count
+                            || previous.tool_call_count != session.tool_call_count
+                            || previous.total_tokens != session.total_tokens
+                            || previous.files_changed != session.files_changed
+                    });
+                    if !changed {
+                        continue;
+                    }
+
+                    store
+                        .insert_or_replace_session(session)
+                        .with_context(|| format!("failed to persist session {}", session.id))?;
+                    known.insert(session.id.clone(), session.clone());
+                    changed_ids.insert(session.id.clone());
+                }
+
+                if changed_ids.is_empty() {
+                    continue;
+                }
+
+                for tool_call in &result.tool_calls {
+                    if tool_call
+                        .session_id
+                        .as_ref()
+                        .is_some_and(|session_id| changed_ids.contains(session_id))
+                        && let Err(error) = store.insert_tool_call(tool_call)
+                    {
+                        eprintln!(
+                            "[watch] {} tool call persistence error: {error}",
+                            meta.display_name
+                        );
+                    }
+                }
+                for memory in &result.memories {
+                    if memory
+                        .source_session_id
+                        .as_ref()
+                        .is_some_and(|session_id| changed_ids.contains(session_id))
+                        && let Err(error) = store.insert_memory(memory)
+                    {
+                        eprintln!(
+                            "[watch] {} memory persistence error: {error}",
+                            meta.display_name
+                        );
+                    }
+                }
+
+                println!(
+                    "[watch] {}: ingested {} changed session(s)",
+                    meta.display_name,
+                    changed_ids.len()
+                );
+                ingested += changed_ids.len();
+            }
+            Err(error) => {
+                eprintln!("[watch] {} ingestion error: {error}", meta.display_name);
+            }
+        }
+    }
+
+    Ok(ingested)
+}
+
+/// Wait for the daemon's graceful shutdown signals.
+async fn wait_for_shutdown_signal() -> Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut interrupt = signal(SignalKind::interrupt())?;
+        let mut terminate = signal(SignalKind::terminate())?;
+        tokio::select! {
+            result = interrupt.recv() => result.context("interrupt channel closed")?,
+            result = terminate.recv() => result.context("terminate channel closed")?,
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await?;
+    }
+
+    Ok(())
+}
+
 /// Format a file size in human-readable form.
 fn human_size(bytes: u64) -> String {
     if bytes < 1024 {
@@ -355,24 +510,114 @@ fn parse_since(s: &str) -> Option<NaiveDateTime> {
     let now = chrono::Utc::now().naive_utc();
     if let Some(days) = s.strip_suffix('d') {
         let n: i64 = days.parse().ok()?;
-        return Some(now - chrono::Duration::days(n));
+        return now.checked_sub_signed(chrono::Duration::try_days(n)?);
     }
     if let Some(weeks) = s.strip_suffix('w') {
         let n: i64 = weeks.parse().ok()?;
-        return Some(now - chrono::Duration::weeks(n));
+        return now.checked_sub_signed(chrono::Duration::try_weeks(n)?);
     }
     if let Some(hours) = s.strip_suffix('h') {
         let n: i64 = hours.parse().ok()?;
-        return Some(now - chrono::Duration::hours(n));
+        return now.checked_sub_signed(chrono::Duration::try_hours(n)?);
     }
-    // Try ISO datetime first, then just date
-    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+    // RFC 3339 values are normalized to UTC; naive ISO values use the UTC
+    // convention used by Remembrant's DuckDB timestamps.
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|timestamp| timestamp.naive_utc())
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+                .ok()
+                .or_else(|| {
+                    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                        .ok()
+                        .map(|date| date.and_hms_opt(0, 0, 0).unwrap())
+                })
+        })
+}
+
+fn parse_since_required(since: Option<&str>) -> Result<Option<NaiveDateTime>> {
+    since
+        .map(|value| parse_since(value).with_context(|| format!("invalid --since value: {value}")))
+        .transpose()
+}
+
+fn parse_metadata_timestamp(value: &str) -> Option<NaiveDateTime> {
+    NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
         .ok()
         .or_else(|| {
-            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            chrono::DateTime::parse_from_rfc3339(value)
                 .ok()
-                .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
+                .map(|timestamp| timestamp.naive_utc())
         })
+}
+
+fn filter_search_results(
+    results: Vec<remembrant_engine::HybridResult>,
+    project: Option<&str>,
+    agent: Option<&str>,
+    content_type: Option<&str>,
+    since: Option<NaiveDateTime>,
+) -> Vec<remembrant_engine::HybridResult> {
+    results
+        .into_iter()
+        .filter(|result| {
+            if let Some(project_filter) = project {
+                let result_project = result
+                    .metadata
+                    .get("project")
+                    .map(|value| value.as_str())
+                    .unwrap_or_default();
+                if !result_project
+                    .to_lowercase()
+                    .contains(&project_filter.to_lowercase())
+                {
+                    return false;
+                }
+            }
+
+            if let Some(agent_filter) = agent {
+                let result_agent = result
+                    .metadata
+                    .get("agent")
+                    .map(|value| value.as_str())
+                    .unwrap_or_default();
+                if !result_agent.eq_ignore_ascii_case(agent_filter) {
+                    return false;
+                }
+            }
+
+            if let Some(type_filter) = content_type {
+                let result_type = result.result_type.to_string().to_lowercase();
+                let metadata_type = result
+                    .metadata
+                    .get("type")
+                    .map(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_lowercase();
+                if !result_type.contains(&type_filter.to_lowercase())
+                    && !metadata_type.contains(&type_filter.to_lowercase())
+                {
+                    return false;
+                }
+            }
+
+            if let Some(since) = since {
+                let timestamp = result
+                    .metadata
+                    .get("started_at")
+                    .or_else(|| result.metadata.get("created_at"))
+                    .or_else(|| result.metadata.get("valid_at"))
+                    .map(|value| value.as_str())
+                    .and_then(parse_metadata_timestamp);
+                if timestamp.is_none_or(|timestamp| timestamp < since) {
+                    return false;
+                }
+            }
+
+            true
+        })
+        .collect()
 }
 
 /// Open LanceDB at the configured (tilde-expanded) path.
@@ -393,6 +638,11 @@ fn truncate(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Return the start of the UTC calendar day containing `now`.
+fn utc_day_start(now: NaiveDateTime) -> NaiveDateTime {
+    now.date().and_hms_opt(0, 0, 0).unwrap_or(now)
+}
+
 // ---------------------------------------------------------------------------
 // Command implementations
 // ---------------------------------------------------------------------------
@@ -403,41 +653,24 @@ fn cmd_init() -> Result<()> {
     // 1. Load or create config
     let config = AppConfig::load()?;
     let config_dir = AppConfig::config_dir()?;
-    std::fs::create_dir_all(&config_dir)?;
+    std::fs::create_dir_all(&config_dir)
+        .with_context(|| format!("failed to create {}", config_dir.display()))?;
     println!("[config] Configuration at {}", config_dir.display());
 
     // 2. Detect agents
     println!("\n--- Agent Detection ---");
-    let detection = detect_agents();
+    let registry = remembrant_engine::ingest::build_registry_from_config(&config)?;
+    let detected: Vec<_> = registry
+        .adapters()
+        .iter()
+        .filter(|adapter| adapter.detect())
+        .map(|adapter| adapter.meta().clone())
+        .collect();
 
-    let mut agents_found = 0u32;
-    if let Some(ref info) = detection.claude_code {
-        println!(
-            "  [+] {} -- {} ({} sessions)",
-            info.name,
-            info.base_path.display(),
-            info.session_count
-        );
-        agents_found += 1;
+    for meta in &detected {
+        println!("  [+] {} -- {}", meta.display_name, meta.default_path);
     }
-    if let Some(ref info) = detection.codex {
-        println!(
-            "  [+] {} -- {} ({} sessions)",
-            info.name,
-            info.base_path.display(),
-            info.session_count
-        );
-        agents_found += 1;
-    }
-    if let Some(ref info) = detection.gemini {
-        println!(
-            "  [+] {} -- {} ({} sessions)",
-            info.name,
-            info.base_path.display(),
-            info.session_count
-        );
-        agents_found += 1;
-    }
+    let agents_found = detected.len();
     if agents_found == 0 {
         println!("  (no agents detected)");
     }
@@ -453,115 +686,69 @@ fn cmd_init() -> Result<()> {
     let mut total_sessions = 0usize;
     let mut total_memories = 0usize;
     let mut total_tool_calls = 0usize;
+    let mut parse_errors = 0usize;
 
-    // Claude Code
-    if detection.claude_code.is_some() {
-        match ClaudeIngester::new() {
-            Ok(ingester) => match ingester.ingest_all() {
-                Ok(result) => {
-                    let s_count = result.sessions.len();
-                    let m_count = result.memories.len();
-                    let t_count = result.tool_calls.len();
+    for adapter in registry.detected() {
+        let meta = adapter.meta();
+        let result = adapter
+            .ingest()
+            .with_context(|| format!("failed to ingest {}", meta.display_name))?;
 
-                    for session in &result.sessions {
-                        if let Err(e) = store.insert_session(session) {
-                            eprintln!("  [!] Failed to insert Claude session {}: {e}", session.id);
-                        }
-                    }
-                    for memory in &result.memories {
-                        if let Err(e) = store.insert_memory(memory) {
-                            eprintln!("  [!] Failed to insert Claude memory: {e}");
-                        }
-                    }
-
-                    total_sessions += s_count;
-                    total_memories += m_count;
-                    total_tool_calls += t_count;
-                    println!(
-                        "  Claude Code: {s_count} sessions, {t_count} tool calls, {m_count} memories"
-                    );
-                }
-                Err(e) => eprintln!("  [!] Claude Code ingestion error: {e}"),
-            },
-            Err(e) => eprintln!("  [!] Claude Code ingester init error: {e}"),
+        for session in &result.sessions {
+            store
+                .insert_or_replace_session(session)
+                .with_context(|| format!("failed to persist {} session {}", meta.id, session.id))?;
         }
-    }
-
-    // Codex
-    if detection.codex.is_some()
-        && let Some(ingester) = CodexIngester::new()
-    {
-        match ingester.ingest_all() {
-            Ok(result) => {
-                let s_count = result.sessions.len();
-                let m_count = result.memories.len();
-                let t_count = result.tool_calls.len();
-
-                for session in &result.sessions {
-                    if let Err(e) = store.insert_session(session) {
-                        eprintln!("  [!] Failed to insert Codex session {}: {e}", session.id);
-                    }
-                }
-                for memory in &result.memories {
-                    if let Err(e) = store.insert_memory(memory) {
-                        eprintln!("  [!] Failed to insert Codex memory: {e}");
-                    }
-                }
-
-                total_sessions += s_count;
-                total_memories += m_count;
-                total_tool_calls += t_count;
-                println!(
-                    "  Codex CLI:   {s_count} sessions, {t_count} tool calls, {m_count} memories"
-                );
-            }
-            Err(e) => eprintln!("  [!] Codex ingestion error: {e}"),
+        for memory in &result.memories {
+            store
+                .insert_memory(memory)
+                .with_context(|| format!("failed to persist {} memory", meta.id))?;
         }
-    }
-
-    // Gemini
-    if detection.gemini.is_some()
-        && let Some(ingester) = GeminiIngester::new()
-    {
-        let (result, sessions, _tool_calls, memories) = ingester.ingest_all();
-
-        for session in &sessions {
-            if let Err(e) = store.insert_session(session) {
-                eprintln!("  [!] Failed to insert Gemini session {}: {e}", session.id);
-            }
-        }
-        for memory in &memories {
-            if let Err(e) = store.insert_memory(memory) {
-                eprintln!("  [!] Failed to insert Gemini memory: {e}");
-            }
+        for tool_call in &result.tool_calls {
+            store.insert_tool_call(tool_call).with_context(|| {
+                format!("failed to persist {} tool call {}", meta.id, tool_call.id)
+            })?;
         }
 
-        total_sessions += result.sessions_found;
-        total_memories += result.memories_found;
-        total_tool_calls += result.tool_calls_found;
+        total_sessions += result.sessions.len();
+        total_memories += result.memories.len();
+        total_tool_calls += result.tool_calls.len();
         println!(
-            "  Gemini CLI:  {} sessions, {} tool calls, {} memories",
-            result.sessions_found, result.tool_calls_found, result.memories_found
+            "  {}: {} sessions, {} tool calls, {} memories",
+            meta.display_name,
+            result.sessions.len(),
+            result.tool_calls.len(),
+            result.memories.len()
         );
-        if !result.errors.is_empty() {
-            for err in &result.errors {
-                eprintln!("  [!] Gemini: {err}");
-            }
+        for error in &result.errors {
+            eprintln!("  [!] {} parse error: {error}", meta.id);
         }
+        parse_errors += result.errors.len();
+    }
+
+    if parse_errors > 0 {
+        anyhow::bail!(
+            "{parse_errors} agent artifact parse error(s) occurred during initialization"
+        );
     }
 
     // Populate projects and file_stats from ingested sessions
-    let all_sessions = store.get_recent_sessions(10_000).unwrap_or_default();
+    let session_count = store.count_sessions()?;
+    let all_sessions = store.get_recent_sessions(session_count.max(1))?;
     let mut projects_seen = std::collections::HashSet::new();
     let mut files_tracked = 0usize;
     for s in &all_sessions {
         if let Some(ref pid) = s.project_id {
             if projects_seen.insert(pid.clone()) {
                 let name = pid.rsplit('/').next().unwrap_or(pid);
-                let _ = store.upsert_project(pid, name, pid);
+                store
+                    .upsert_project(pid, name, pid)
+                    .with_context(|| format!("failed to persist project {pid}"))?;
             }
             for f in &s.files_changed {
-                let _ = store.upsert_file_stat(f, pid);
+                store
+                    .upsert_file_stat(f, pid)
+                    .with_context(|| format!("failed to persist file stat {f}"))?;
                 files_tracked += 1;
             }
         }
@@ -588,21 +775,18 @@ fn cmd_status() -> Result<()> {
     // 1. Daemon status
     let pid_path = pid_file_path()?;
     if pid_path.exists() {
-        let pid_str = std::fs::read_to_string(&pid_path).unwrap_or_default();
-        let pid_str = pid_str.trim();
-        // Check if process is running
-        let running = std::process::Command::new("kill")
-            .args(["-0", pid_str])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
+        let pid_text = std::fs::read_to_string(&pid_path)
+            .with_context(|| format!("failed to read {}", pid_path.display()))?;
+        let pid = pid_text
+            .trim()
+            .parse::<u32>()
+            .with_context(|| format!("invalid PID in {}: {pid_text}", pid_path.display()))?;
+        let running = process_is_running(pid);
 
         if running {
-            println!("[daemon] Running (PID {pid_str})");
+            println!("[daemon] Running (PID {pid})");
         } else {
-            println!("[daemon] Stale PID file (process {pid_str} not running)");
+            println!("[daemon] Stale PID file (process {pid} not running)");
         }
     } else {
         println!("[daemon] Not running");
@@ -610,33 +794,13 @@ fn cmd_status() -> Result<()> {
 
     // 2. Detected agents
     println!("\n--- Agents ---");
-    let detection = detect_agents();
-    let mut any_agent = false;
-    if let Some(ref info) = detection.claude_code {
-        println!(
-            "  Claude Code: {} ({} sessions)",
-            info.base_path.display(),
-            info.session_count
-        );
-        any_agent = true;
+    let registry = remembrant_engine::ingest::build_registry_from_config(&config)?;
+    let detected_agents = registry.detected();
+    for adapter in &detected_agents {
+        let meta = adapter.meta();
+        println!("  {}: {}", meta.display_name, meta.default_path);
     }
-    if let Some(ref info) = detection.codex {
-        println!(
-            "  Codex CLI:   {} ({} sessions)",
-            info.base_path.display(),
-            info.session_count
-        );
-        any_agent = true;
-    }
-    if let Some(ref info) = detection.gemini {
-        println!(
-            "  Gemini CLI:  {} ({} sessions)",
-            info.base_path.display(),
-            info.session_count
-        );
-        any_agent = true;
-    }
-    if !any_agent {
+    if detected_agents.is_empty() {
         println!("  (no agents detected)");
     }
 
@@ -646,26 +810,18 @@ fn cmd_status() -> Result<()> {
 
     let db_path = expand_tilde(&config.storage.duckdb_path);
     if db_path.exists() {
-        let size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+        let size = std::fs::metadata(&db_path)
+            .with_context(|| format!("failed to read metadata for {}", db_path.display()))?
+            .len();
         println!(
             "  DuckDB:      {} ({})",
             db_path.display(),
             human_size(size)
         );
 
-        // Row counts
-        match open_store(&config) {
-            Ok(store) => {
-                let sessions = store.get_recent_sessions(i32::MAX as usize)?;
-                println!("  Sessions:    {}", sessions.len());
-
-                let memories = store.search_memories("")?;
-                println!("  Memories:    {}", memories.len());
-            }
-            Err(e) => {
-                eprintln!("  [!] Could not open DuckDB: {e}");
-            }
-        }
+        let store = open_store(&config)?;
+        println!("  Sessions:    {}", store.count_sessions()?);
+        println!("  Memories:    {}", store.count_memories()?);
     } else {
         println!("  DuckDB:      {} (not created yet)", db_path.display());
         println!("  Run `rem init` first.");
@@ -676,131 +832,149 @@ fn cmd_status() -> Result<()> {
         println!("  LanceDB:     {}", lance_path.display());
     }
 
-    let graph_path = expand_tilde(&config.storage.graph_db_path);
-    if graph_path.exists() {
-        println!("  Graph DB:    {}", graph_path.display());
-    }
-
     Ok(())
 }
 
 async fn cmd_watch() -> Result<()> {
     let config = AppConfig::load()?;
-
-    // Write PID file
-    let pid = std::process::id();
     let pid_path = pid_file_path()?;
-    if let Some(parent) = pid_path.parent() {
-        std::fs::create_dir_all(parent)?;
+    ensure_no_active_pid_file(&pid_path)?;
+    let registry = Arc::new(remembrant_engine::ingest::build_registry_from_config(
+        &config,
+    )?);
+    let store = Arc::new(open_store(&config)?);
+    let watcher = remembrant_engine::FileWatcher::from_config(&config);
+
+    // Native JSONL/JSON/markdown adapters are event-driven. Configured SQLite
+    // adapters can be a single database file, so they retain a low-frequency
+    // polling fallback instead of forcing a filesystem watch onto a file that
+    // may be replaced atomically.
+    let native_adapter_ids: HashSet<String> = [
+        config.agents.claude_code.enabled.then_some("claude_code"),
+        config.agents.codex.enabled.then_some("codex"),
+        config.agents.gemini.enabled.then_some("gemini"),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::to_string)
+    .chain(
+        config
+            .agents
+            .dynamic
+            .iter()
+            .filter(|agent| agent.enabled && agent.adapter_type == "jsonl")
+            .map(|agent| agent.id.clone()),
+    )
+    .collect();
+    let dynamic_adapter_ids: HashSet<String> = config
+        .agents
+        .dynamic
+        .iter()
+        .filter(|agent| agent.enabled && agent.adapter_type == "sqlite")
+        .map(|agent| agent.id.clone())
+        .collect();
+    let active_native_paths = watcher
+        .watch_paths()
+        .iter()
+        .filter(|path| path.is_dir())
+        .count();
+    let poll_interval = std::time::Duration::from_millis(config.watch.debounce_ms.max(1_000));
+    if registry.detected().is_empty() {
+        anyhow::bail!(
+            "no enabled agent artifacts were detected; run `rem status` to inspect configured paths"
+        );
     }
-    std::fs::write(&pid_path, pid.to_string())?;
+
+    // Write the PID file after the configuration and database are known to be
+    // valid so a failed startup never leaves a stale daemon marker.
+    let pid = std::process::id();
+    if let Some(parent) = pid_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    std::fs::write(&pid_path, pid.to_string())
+        .with_context(|| format!("failed to write {}", pid_path.display()))?;
     println!("[watch] PID {pid} written to {}", pid_path.display());
-
-    let store = open_store(&config)?;
-    let debounce_secs = std::cmp::max(config.watch.debounce_ms / 1000, 5);
-
     println!(
-        "[watch] Watching for changes (polling every {debounce_secs}s). Press Ctrl+C to stop."
+        "[watch] Event watching {active_native_paths} native artifact director(y/ies); \
+        polling {} dynamic adapter(s) every {} ms. Press Ctrl+C to stop.",
+        dynamic_adapter_ids.len(),
+        poll_interval.as_millis()
     );
 
-    let pid_path_clone = pid_path.clone();
-    let shutdown = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to listen for Ctrl+C");
-    };
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+    let watcher_debounce = config.watch.debounce_ms;
+    std::thread::spawn(move || {
+        let file_watcher =
+            remembrant_engine::FileWatcher::new(watcher.watch_paths().to_vec(), watcher_debounce);
+        let sender = event_tx;
+        if let Err(error) = file_watcher.run(move |events| {
+            // An event is only a hint: ingestion performs a normalized
+            // diff, so duplicate or partial-write events are safe.
+            println!("[watch] received {} artifact change(s)", events.len());
+            let _ = sender.send(());
+        }) {
+            eprintln!("[watch] filesystem watcher error: {error}");
+        }
+        tracing::debug!("native watcher thread exited");
+    });
 
-    let poll_loop = async {
+    let event_registry = Arc::clone(&registry);
+    let event_store = Arc::clone(&store);
+    let native_ids = native_adapter_ids.clone();
+    tokio::spawn(async move {
+        while event_rx.recv().await.is_some() {
+            match ingest_watch_snapshot(&event_store, &event_registry, Some(&native_ids)) {
+                Ok(changed_sessions) if changed_sessions > 0 => match build_graph(&event_store) {
+                    Ok(graph) => println!(
+                        "[watch] rebuilt graph with {} nodes and {} edges",
+                        graph.node_count(),
+                        graph.edge_count()
+                    ),
+                    Err(error) => {
+                        eprintln!("[watch] graph rebuild error: {error:#}");
+                    }
+                },
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("[watch] persistence error: {error:#}");
+                }
+            }
+        }
+    });
+
+    let poll_registry = Arc::clone(&registry);
+    let poll_store = Arc::clone(&store);
+    let poll_loop = async move {
+        if dynamic_adapter_ids.is_empty() {
+            std::future::pending::<()>().await;
+        }
         loop {
-            tokio::time::sleep(tokio::time::Duration::from_secs(debounce_secs)).await;
-
-            // Re-ingest Claude Code
-            if let Ok(ingester) = ClaudeIngester::new() {
-                match ingester.ingest_all() {
-                    Ok(result) => {
-                        if result.sessions_count > 0 {
-                            let mut inserted = 0usize;
-                            for session in &result.sessions {
-                                // Insert, ignoring duplicates
-                                if store.insert_session(session).is_ok() {
-                                    inserted += 1;
-                                }
-                            }
-                            for memory in &result.memories {
-                                let _ = store.insert_memory(memory);
-                            }
-                            if inserted > 0 {
-                                println!(
-                                    "[watch] Claude Code: ingested {inserted} sessions, {} memories",
-                                    result.memories_count
-                                );
-                            }
-                        }
+            tokio::time::sleep(poll_interval).await;
+            match ingest_watch_snapshot(&poll_store, &poll_registry, Some(&dynamic_adapter_ids)) {
+                Ok(changed_sessions) if changed_sessions > 0 => match build_graph(&poll_store) {
+                    Ok(graph) => println!(
+                        "[watch] rebuilt graph with {} nodes and {} edges",
+                        graph.node_count(),
+                        graph.edge_count()
+                    ),
+                    Err(error) => {
+                        eprintln!("[watch] graph rebuild error: {error:#}");
                     }
-                    Err(e) => {
-                        eprintln!("[watch] Claude Code ingestion error: {e}");
-                    }
-                }
-            }
-
-            // Re-ingest Codex
-            if let Some(ingester) = CodexIngester::new() {
-                match ingester.ingest_all() {
-                    Ok(result) => {
-                        let mut inserted = 0usize;
-                        for session in &result.sessions {
-                            if store.insert_session(session).is_ok() {
-                                inserted += 1;
-                            }
-                        }
-                        for memory in &result.memories {
-                            let _ = store.insert_memory(memory);
-                        }
-                        if inserted > 0 {
-                            println!(
-                                "[watch] Codex: ingested {inserted} sessions, {} memories",
-                                result.memories.len()
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[watch] Codex ingestion error: {e}");
-                    }
-                }
-            }
-
-            // Re-ingest Gemini
-            if let Some(ingester) = GeminiIngester::new() {
-                let (_result, sessions, _tool_calls, memories) = ingester.ingest_all();
-                let mut inserted = 0usize;
-                for session in &sessions {
-                    if store.insert_session(session).is_ok() {
-                        inserted += 1;
-                    }
-                }
-                for memory in &memories {
-                    let _ = store.insert_memory(memory);
-                }
-                if inserted > 0 {
-                    println!(
-                        "[watch] Gemini: ingested {inserted} sessions, {} memories",
-                        memories.len()
-                    );
-                }
+                },
+                Ok(_) => {}
+                Err(error) => eprintln!("[watch] persistence error: {error:#}"),
             }
         }
     };
 
-    tokio::select! {
-        _ = shutdown => {
-            println!("\n[watch] Shutting down...");
-        }
-        _ = poll_loop => {}
-    }
+    wait_for_shutdown_signal().await?;
+    println!("\n[watch] Shutting down...");
+    drop(poll_loop);
 
-    // Cleanup PID file
-    if pid_path_clone.exists() {
-        let _ = std::fs::remove_file(&pid_path_clone);
+    if pid_path.exists() {
+        std::fs::remove_file(&pid_path)
+            .with_context(|| format!("failed to remove {}", pid_path.display()))?;
         println!("[watch] PID file removed");
     }
 
@@ -815,29 +989,45 @@ fn cmd_stop() -> Result<()> {
         return Ok(());
     }
 
-    let pid_str = std::fs::read_to_string(&pid_path).context("failed to read PID file")?;
-    let pid_str = pid_str.trim();
+    let pid_text = std::fs::read_to_string(&pid_path).context("failed to read PID file")?;
+    let pid = pid_text
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("invalid PID in {}: {pid_text}", pid_path.display()))?;
 
-    println!("[stop] Sending SIGTERM to PID {pid_str}...");
+    println!("[stop] Sending SIGTERM to PID {pid}...");
 
     let status = std::process::Command::new("kill")
-        .args(["-TERM", pid_str])
+        .args(["-TERM", &pid.to_string()])
         .status()
         .context("failed to send SIGTERM")?;
 
     if status.success() {
         println!("[stop] Signal sent successfully");
     } else {
-        eprintln!("[stop] kill returned non-zero status (process may already be stopped)");
+        if process_is_running(pid) {
+            anyhow::bail!("failed to stop watcher PID {pid}");
+        }
+        println!("[stop] PID {pid} was already stopped; removing stale PID file");
     }
 
-    // Remove PID file
-    if let Err(e) = std::fs::remove_file(&pid_path) {
-        eprintln!("[stop] Warning: could not remove PID file: {e}");
-    } else {
-        println!("[stop] PID file removed");
+    // Give the daemon a moment to clean up its own marker, then finish the job
+    // if it exited before flushing.
+    for _ in 0..100 {
+        if !pid_path.exists() {
+            println!("[stop] PID file removed");
+            println!("[stop] Daemon stopped.");
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
+    if process_is_running(pid) {
+        anyhow::bail!("watcher PID {pid} did not stop within five seconds");
+    }
+    std::fs::remove_file(&pid_path)
+        .with_context(|| format!("failed to remove stale PID file {}", pid_path.display()))?;
+    println!("[stop] PID file removed");
     println!("[stop] Daemon stopped.");
     Ok(())
 }
@@ -903,7 +1093,7 @@ fn cmd_recent(limit: usize, agent: Option<&str>, project: Option<&str>) -> Resul
             .collect::<String>();
 
         let id_display = if s.id.len() > 36 {
-            format!("{}...", &s.id[..33])
+            truncate(&s.id, 36)
         } else {
             s.id.clone()
         };
@@ -930,7 +1120,7 @@ async fn cmd_search(
     let config = AppConfig::load()?;
     let store = open_store(&config)?;
 
-    let since_dt = since.and_then(parse_since);
+    let since_dt = parse_since_required(since)?;
 
     // JSON output mode: uses HybridSearch text-only for fast agent-friendly results
     if json_output {
@@ -941,6 +1131,8 @@ async fn cmd_search(
         } else {
             search.search_text_only(query, 20)?
         };
+
+        let results = filter_search_results(results, project, agent, content_type, since_dt);
 
         let json_results: Vec<serde_json::Value> = results
             .iter()
@@ -983,13 +1175,7 @@ async fn cmd_search(
         match open_lance_store(&config).await {
             Ok(lance) => {
                 search
-                    .search(
-                        query,
-                        40,
-                        Some(&lance),
-                        None, // graph boost TODO: unify GraphStore/DuckStore backends
-                        Some(&embedder),
-                    )
+                    .search(query, 40, Some(&lance), Some(&store), Some(&embedder))
                     .await?
             }
             Err(e) => {
@@ -1000,45 +1186,10 @@ async fn cmd_search(
     };
 
     // Post-filter by project, agent, content_type, since
-    let results: Vec<_> = results
+    let results = filter_search_results(results, project, agent, content_type, since_dt)
         .into_iter()
-        .filter(|r| {
-            if let Some(proj) = project {
-                let rp = r.metadata.get("project").map(|s| s.as_str()).unwrap_or("");
-                if !rp.to_lowercase().contains(&proj.to_lowercase()) {
-                    return false;
-                }
-            }
-            if let Some(a) = agent {
-                let ra = r.metadata.get("agent").map(|s| s.as_str()).unwrap_or("");
-                if !ra.eq_ignore_ascii_case(a) {
-                    return false;
-                }
-            }
-            if let Some(ctype) = content_type {
-                let rt = r.metadata.get("type").map(|s| s.as_str()).unwrap_or("");
-                if !rt.to_lowercase().contains(&ctype.to_lowercase()) {
-                    return false;
-                }
-            }
-            if let Some(since_dt) = since_dt {
-                let ts_str = r
-                    .metadata
-                    .get("started_at")
-                    .or_else(|| r.metadata.get("created_at"))
-                    .or_else(|| r.metadata.get("valid_at"));
-                if let Some(ts) = ts_str
-                    && let Ok(ts) =
-                        chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S%.f")
-                    && ts < since_dt
-                {
-                    return false;
-                }
-            }
-            true
-        })
         .take(20)
-        .collect();
+        .collect::<Vec<_>>();
 
     if results.is_empty() {
         println!("No results found for: {query}");
@@ -1072,7 +1223,14 @@ fn cmd_find(query: &str) -> Result<()> {
     let config = AppConfig::load()?;
     let store = open_store(&config)?;
 
-    let memories = store.search_memories(query)?;
+    let mut memories = store.search_memories(query)?;
+    let mut memory_ids: std::collections::HashSet<String> =
+        memories.iter().map(|memory| memory.id.clone()).collect();
+    for memory in store.search_memories_by_tag(query, 100)? {
+        if memory_ids.insert(memory.id.clone()) {
+            memories.push(memory);
+        }
+    }
     let sessions = store.search_sessions_by_summary(query)?;
 
     let total = memories.len() + sessions.len();
@@ -1103,7 +1261,7 @@ fn cmd_find(query: &str) -> Result<()> {
                 .unwrap_or_else(|| "-".to_string());
             let summary = s.summary.as_deref().unwrap_or("-");
             let id_short = if s.id.len() > 12 {
-                format!("{}...", &s.id[..12])
+                truncate(&s.id, 12)
             } else {
                 s.id.clone()
             };
@@ -1130,7 +1288,7 @@ fn cmd_brief(project: Option<&str>, today: bool, json_output: bool) -> Result<()
 
     // Determine time window
     let since = if today {
-        now - chrono::Duration::hours(24)
+        utc_day_start(now)
     } else {
         now - chrono::Duration::days(3)
     };
@@ -1202,7 +1360,7 @@ fn cmd_brief(project: Option<&str>, today: bool, json_output: bool) -> Result<()
         return Ok(());
     }
 
-    let window_label = if today { "24h" } else { "3 days" };
+    let window_label = if today { "today" } else { "3 days" };
 
     println!("=== Daily Brief ({}) ===\n", today_date.format("%Y-%m-%d"));
 
@@ -1317,6 +1475,10 @@ fn cmd_context_topic(
 }
 
 fn cmd_consolidate(project: Option<&str>, threshold: f64, json: bool) -> Result<()> {
+    if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+        anyhow::bail!("--threshold must be between 0.0 and 1.0");
+    }
+
     let config = AppConfig::load()?;
     let store = open_store(&config)?;
 
@@ -1458,20 +1620,17 @@ fn cmd_timeline(topic: &str, since: Option<&str>) -> Result<()> {
 
     // Apply optional since filter
     let (sessions, memories) = if let Some(since_str) = since {
-        if let Some(since_dt) = parse_since(since_str) {
-            let filtered_sessions: Vec<_> = sessions
-                .into_iter()
-                .filter(|s| s.started_at.is_some_and(|dt| dt >= since_dt))
-                .collect();
-            let filtered_memories: Vec<_> = memories
-                .into_iter()
-                .filter(|m| m.created_at.is_some_and(|dt| dt >= since_dt))
-                .collect();
-            (filtered_sessions, filtered_memories)
-        } else {
-            eprintln!("Warning: could not parse --since value: {since_str}");
-            (sessions, memories)
-        }
+        let since_dt = parse_since_required(Some(since_str))?
+            .context("a --since value must produce a timestamp")?;
+        let filtered_sessions: Vec<_> = sessions
+            .into_iter()
+            .filter(|s| s.started_at.is_some_and(|dt| dt >= since_dt))
+            .collect();
+        let filtered_memories: Vec<_> = memories
+            .into_iter()
+            .filter(|m| m.created_at.is_some_and(|dt| dt >= since_dt))
+            .collect();
+        (filtered_sessions, filtered_memories)
     } else {
         (sessions, memories)
     };
@@ -1612,7 +1771,7 @@ fn cmd_note(text: &str, project: Option<&str>, tags: Option<&[String]>) -> Resul
     let config = AppConfig::load()?;
     let store = open_store(&config)?;
 
-    let id = store.insert_note(text, project)?;
+    let id = store.insert_note_with_tags(text, project, tags.unwrap_or_default())?;
 
     let tag_str = tags.map(|t| t.join(", ")).unwrap_or_default();
 
@@ -1633,12 +1792,16 @@ fn cmd_forget(session_id: &str) -> Result<()> {
     if store.delete_session(session_id)? {
         println!("Session {session_id} deleted.");
     } else {
-        println!("Session {session_id} not found.");
+        anyhow::bail!("Session {session_id} not found");
     }
     Ok(())
 }
 
 fn cmd_export(project: Option<&str>, format: &str, output: Option<&str>) -> Result<()> {
+    if !matches!(format, "markdown" | "json") {
+        anyhow::bail!("unsupported export format '{format}'; use markdown or json");
+    }
+
     let config = AppConfig::load()?;
     let store = open_store(&config)?;
 
@@ -1647,7 +1810,8 @@ fn cmd_export(project: Option<&str>, format: &str, output: Option<&str>) -> Resu
     let sessions = if let Some(proj) = project {
         store.get_project_sessions(proj)?
     } else {
-        store.get_recent_sessions(100)?
+        let session_count = store.count_sessions()?;
+        store.get_recent_sessions(session_count.max(1))?
     };
 
     let content = match format {
@@ -1734,7 +1898,7 @@ fn cmd_export(project: Option<&str>, format: &str, output: Option<&str>) -> Resu
                         .started_at
                         .map(|dt| dt.format("%Y-%m-%d").to_string())
                         .unwrap_or_default();
-                    let id_short = if s.id.len() > 8 { &s.id[..8] } else { &s.id };
+                    let id_short = truncate(&s.id, 8);
                     md.push_str(&format!("- {id_short}: {summary} ({date}, {})\n", s.agent));
                 }
             }
@@ -1853,7 +2017,12 @@ fn cmd_gc() -> Result<()> {
     let store = open_store(&config)?;
 
     let retention_days = config.retention.raw_transcripts_days;
-    let cutoff = chrono::Utc::now().naive_utc() - chrono::Duration::days(retention_days as i64);
+    let retention_duration = chrono::Duration::try_days(retention_days as i64)
+        .context("retention duration is out of range")?;
+    let cutoff = chrono::Utc::now()
+        .naive_utc()
+        .checked_sub_signed(retention_duration)
+        .context("retention cutoff is out of range")?;
 
     // Get DB size before
     let db_path = expand_tilde(&config.storage.duckdb_path);
@@ -1864,6 +2033,7 @@ fn cmd_gc() -> Result<()> {
     };
 
     let deleted = store.gc_sessions_before(cutoff)?;
+    let orphaned_tool_calls = store.delete_orphaned_tool_calls()?;
 
     let size_after = if db_path.exists() {
         std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0)
@@ -1875,6 +2045,7 @@ fn cmd_gc() -> Result<()> {
 
     println!("Garbage collection:");
     println!("  Deleted {deleted} sessions older than {retention_days} days");
+    println!("  Deleted {orphaned_tool_calls} orphaned tool calls");
     println!("  Freed ~{}", human_size(freed));
 
     Ok(())
@@ -1890,98 +2061,62 @@ async fn cmd_ingest(skip_embed: bool, skip_distill: bool) -> Result<()> {
 
     // ── Step 1: Detect & parse agent artifacts ──────────────────────
     println!("▸ Step 1/4: Parsing agent artifacts...");
-    let detection = detect_agents();
 
     let mut all_sessions = Vec::new();
     let mut all_memories = Vec::new();
     let mut all_tool_calls = Vec::new();
+    let mut parse_errors = 0usize;
 
-    // Claude Code
-    if detection.claude_code.is_some() {
-        match ClaudeIngester::new() {
-            Ok(ingester) => match ingester.ingest_all() {
-                Ok(result) => {
-                    println!(
-                        "  ✓ Claude Code: {} sessions, {} tool calls, {} memories",
-                        result.sessions.len(),
-                        result.tool_calls.len(),
-                        result.memories.len()
-                    );
-                    for s in &result.sessions {
-                        let _ = store.insert_or_replace_session(s);
-                    }
-                    for m in &result.memories {
-                        let _ = store.insert_memory(m);
-                    }
-                    for tc in &result.tool_calls {
-                        let _ = store.insert_tool_call(tc);
-                    }
-                    all_sessions.extend(result.sessions);
-                    all_memories.extend(result.memories);
-                    all_tool_calls.extend(result.tool_calls);
-                }
-                Err(e) => eprintln!("  ✗ Claude Code: {e}"),
-            },
-            Err(e) => eprintln!("  ✗ Claude Code init: {e}"),
-        }
-    }
-
-    // Codex
-    if detection.codex.is_some()
-        && let Some(ingester) = CodexIngester::new()
-    {
-        match ingester.ingest_all() {
+    let registry = remembrant_engine::ingest::build_registry_from_config(&config)?;
+    for adapter in registry.detected() {
+        let meta = adapter.meta();
+        match adapter.ingest() {
             Ok(result) => {
                 println!(
-                    "  ✓ Codex CLI:   {} sessions, {} tool calls, {} memories",
+                    "  ✓ {}: {} sessions, {} tool calls, {} memories",
+                    meta.display_name,
                     result.sessions.len(),
                     result.tool_calls.len(),
                     result.memories.len()
                 );
-                for s in &result.sessions {
-                    let _ = store.insert_or_replace_session(s);
+
+                for session in &result.sessions {
+                    store.insert_or_replace_session(session).with_context(|| {
+                        format!("failed to persist {} session {}", meta.id, session.id)
+                    })?;
                 }
-                for m in &result.memories {
-                    let _ = store.insert_memory(m);
+                for memory in &result.memories {
+                    store
+                        .insert_memory(memory)
+                        .with_context(|| format!("failed to persist {} memory", meta.id))?;
                 }
-                for tc in &result.tool_calls {
-                    let _ = store.insert_tool_call(tc);
+                for tool_call in &result.tool_calls {
+                    store.insert_tool_call(tool_call).with_context(|| {
+                        format!("failed to persist {} tool call {}", meta.id, tool_call.id)
+                    })?;
                 }
+
                 all_sessions.extend(result.sessions);
                 all_memories.extend(result.memories);
                 all_tool_calls.extend(result.tool_calls);
+                for error in &result.errors {
+                    eprintln!("  ! {} parse error: {error}", meta.id);
+                }
+                parse_errors += result.errors.len();
             }
-            Err(e) => eprintln!("  ✗ Codex CLI: {e}"),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to ingest {}", meta.display_name));
+            }
         }
     }
-
-    // Gemini
-    if detection.gemini.is_some()
-        && let Some(ingester) = GeminiIngester::new()
-    {
-        let (result, sessions, tool_calls, memories) = ingester.ingest_all();
-        println!(
-            "  ✓ Gemini CLI:  {} sessions, {} tool calls, {} memories",
-            result.sessions_found, result.tool_calls_found, result.memories_found
-        );
-        for s in &sessions {
-            let _ = store.insert_or_replace_session(s);
-        }
-        for m in &memories {
-            let _ = store.insert_memory(m);
-        }
-        for tc in &tool_calls {
-            let _ = store.insert_tool_call(tc);
-        }
-        all_sessions.extend(sessions);
-        all_memories.extend(memories);
-        all_tool_calls.extend(tool_calls);
-    }
-
     let total_s = all_sessions.len();
     let total_m = all_memories.len();
     let total_tc = all_tool_calls.len();
     println!("\n  Total: {total_s} sessions, {total_tc} tool calls, {total_m} memories → DuckDB ✓");
+    if parse_errors > 0 {
+        anyhow::bail!("{parse_errors} agent artifact parse error(s) occurred during ingestion");
+    }
 
     // ── Step 2: LLM Distillation ────────────────────────────────────
     if skip_distill {
@@ -2015,15 +2150,21 @@ async fn cmd_ingest(skip_embed: bool, skip_distill: bool) -> Result<()> {
             match distiller.distill_session(session, &text).await {
                 Ok(distilled) => {
                     for d in distiller.to_decisions(&distilled) {
-                        let _ = store.insert_decision(&d);
+                        store
+                            .insert_decision(&d)
+                            .context("failed to persist distilled decision")?;
                         decisions_count += 1;
                     }
                     for m in distiller.to_memories(&distilled) {
-                        let _ = store.insert_memory(&m);
+                        store
+                            .insert_memory(&m)
+                            .context("failed to persist distilled memory")?;
                         patterns_count += 1;
                     }
                     for f in distiller.to_facts(&distilled, Some(&session.agent)) {
-                        let _ = store.upsert_fact(&f);
+                        store
+                            .upsert_fact(&f)
+                            .context("failed to persist distilled fact")?;
                         facts_count += 1;
                     }
                     problems_count += distilled.problems.len();
@@ -2077,6 +2218,9 @@ async fn cmd_ingest(skip_embed: bool, skip_distill: bool) -> Result<()> {
             "  Embedded: {} chunks ({} stored, {} errors)",
             stats.chunks_embedded, stats.chunks_stored, stats.errors
         );
+        if stats.errors > 0 {
+            anyhow::bail!("embedding pipeline reported {} errors", stats.errors);
+        }
     }
 
     // ── Step 4: Graph ───────────────────────────────────────────────
@@ -2105,9 +2249,12 @@ fn print_summary(sessions: usize, memories: usize, tool_calls: usize) {
 
 /// Build an in-memory graph from all DuckDB data.
 fn build_graph(store: &DuckStore) -> Result<GraphBuilder<&DuckStore>> {
-    let sessions = store.get_recent_sessions(10_000)?;
-    let memories = store.get_memories(None, 10_000)?;
-    let decisions = store.get_decisions(None, 10_000)?;
+    let session_count = store.count_sessions()?;
+    let memory_count = store.count_memories()?;
+    let decision_count = store.count_decisions()?;
+    let sessions = store.get_recent_sessions(session_count.max(1))?;
+    let memories = store.get_memories(None, memory_count.max(1))?;
+    let decisions = store.get_decisions(None, decision_count.max(1))?;
     let tool_calls = Vec::new();
 
     let builder = GraphBuilder::with_backend(store);
@@ -2115,8 +2262,7 @@ fn build_graph(store: &DuckStore) -> Result<GraphBuilder<&DuckStore>> {
     Ok(builder)
 }
 
-#[allow(unused_variables)]
-fn cmd_analyze(path: &str, project: Option<&str>) -> Result<()> {
+fn cmd_analyze(_path: &str, _project: Option<&str>) -> Result<()> {
     #[cfg(not(feature = "code-analysis"))]
     {
         anyhow::bail!(
@@ -2131,9 +2277,9 @@ fn cmd_analyze(path: &str, project: Option<&str>) -> Result<()> {
 
         let config = AppConfig::load()?;
         let store = open_store(&config)?;
-        let repo_path = expand_tilde(path);
+        let repo_path = expand_tilde(_path);
 
-        let project_id = project.map(String::from).unwrap_or_else(|| {
+        let project_id = _project.map(String::from).unwrap_or_else(|| {
             repo_path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -2146,10 +2292,9 @@ fn cmd_analyze(path: &str, project: Option<&str>) -> Result<()> {
 
         let analyzer = CodeAnalyzer::new(&project_id, &repo_path);
 
-        // Use an in-memory graph store for code analysis population
-        let graph_store = remembrant_engine::store::graph::GraphStore::new();
-
-        let result = analyzer.analyze(&store, &graph_store)?;
+        // Persist code graph relationships in DuckDB alongside the symbol rows.
+        let graph = GraphBuilder::with_backend(&store);
+        let result = analyzer.analyze(&store, graph.backend())?;
 
         println!("\nAnalysis complete:");
         println!("  Files analyzed:    {}", result.files_analyzed);
@@ -2161,12 +2306,15 @@ fn cmd_analyze(path: &str, project: Option<&str>) -> Result<()> {
     }
 }
 
-async fn cmd_embed(path: &str, _update: bool) -> Result<()> {
+async fn cmd_embed(path: &str, update: bool) -> Result<()> {
     let config = AppConfig::load()?;
     let abs_path =
         std::fs::canonicalize(path).with_context(|| format!("failed to resolve path: {path}"))?;
 
     println!("Embedding repository: {}", abs_path.display());
+    if update {
+        println!("Mode: replace existing embeddings for this project");
+    }
 
     let embedder = RepoEmbedder::new(&abs_path);
 
@@ -2186,7 +2334,12 @@ async fn cmd_embed(path: &str, _update: bool) -> Result<()> {
     let lance_store = open_lance_store(&config).await?;
 
     let result = embedder
-        .embed_and_store(&embed_provider, &lance_store, config.embedding.batch_size)
+        .embed_and_store_with_update(
+            &embed_provider,
+            &lance_store,
+            config.embedding.batch_size,
+            update,
+        )
         .await;
 
     match result {
@@ -2199,6 +2352,7 @@ async fn cmd_embed(path: &str, _update: bool) -> Result<()> {
             );
             if result.errors > 0 {
                 println!("  Errors: {}", result.errors);
+                anyhow::bail!("{} repository chunk(s) failed to embed", result.errors);
             }
         }
         Err(e) => {
@@ -2213,6 +2367,7 @@ async fn cmd_embed(path: &str, _update: bool) -> Result<()> {
                      4. Run `rem embed` again\n\n\
                      Underlying error: {e:#}"
                 );
+                return Err(e).context("embed failed");
             } else {
                 return Err(e).context("embed failed");
             }
@@ -2317,35 +2472,111 @@ impl WebState {
     }
 }
 
-async fn web_index() -> Html<&'static str> {
-    Html(include_str!("web_dashboard.html"))
+/// Keep local API page sizes bounded without rejecting client typos such as
+/// zero or an accidentally enormous value.
+fn api_limit(requested: Option<usize>, default: usize, maximum: usize) -> usize {
+    requested.unwrap_or(default).clamp(1, maximum)
+}
+
+async fn web_index() -> impl axum::response::IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+        ],
+        include_str!("web_dashboard.html"),
+    )
+}
+
+async fn web_dashboard_css() -> impl axum::response::IntoResponse {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/css; charset=utf-8"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        include_str!("web_dashboard.css"),
+    )
+}
+
+async fn web_dashboard_js() -> impl axum::response::IntoResponse {
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        include_str!("web_dashboard.js"),
+    )
 }
 
 async fn web_stats(
     State(state): State<Arc<WebState>>,
 ) -> Result<axum::Json<serde_json::Value>, StatusCode> {
     let store = state.store()?;
-    let sessions = store
-        .count_sessions()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let memories = store
-        .count_memories()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let decisions = store
-        .count_decisions()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let tool_calls = store
-        .count_tool_calls()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let projects = store
-        .get_project_ids()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let map_store_error = |_| StatusCode::INTERNAL_SERVER_ERROR;
+    let sessions = store.count_sessions().map_err(map_store_error)?;
+    let memories = store.count_memories().map_err(map_store_error)?;
+    let decisions = store.count_decisions().map_err(map_store_error)?;
+    let tool_calls = store.count_tool_calls().map_err(map_store_error)?;
+    let facts = store.count_facts().map_err(map_store_error)?;
+    let active_facts = store.count_active_facts().map_err(map_store_error)?;
+    let projects = store.get_project_ids().map_err(map_store_error)?;
+
+    let now = chrono::Utc::now().naive_utc();
+    let today_start = now.date().and_hms_opt(0, 0, 0).unwrap_or(now);
+    let week_start = (now - chrono::Duration::days(7))
+        .date()
+        .and_hms_opt(0, 0, 0)
+        .unwrap_or(now);
+
+    let today_sessions = store
+        .count_sessions_since(today_start)
+        .map_err(map_store_error)?;
+    let today_memories = store
+        .count_memories_since(today_start)
+        .map_err(map_store_error)?;
+    let today_decisions = store
+        .count_decisions_since(today_start)
+        .map_err(map_store_error)?;
+    let today_tool_calls = store
+        .count_tool_calls_since(today_start)
+        .map_err(map_store_error)?;
+
+    let week_sessions = store
+        .count_sessions_since(week_start)
+        .map_err(map_store_error)?;
+    let week_memories = store
+        .count_memories_since(week_start)
+        .map_err(map_store_error)?;
+    let week_decisions = store
+        .count_decisions_since(week_start)
+        .map_err(map_store_error)?;
+    let week_tool_calls = store
+        .count_tool_calls_since(week_start)
+        .map_err(map_store_error)?;
+
     Ok(axum::Json(serde_json::json!({
         "sessions": sessions,
         "memories": memories,
         "decisions": decisions,
         "tool_calls": tool_calls,
+        "facts": facts,
+        "active_facts": active_facts,
         "projects": projects.len(),
+        "today": {
+            "sessions": today_sessions,
+            "memories": today_memories,
+            "decisions": today_decisions,
+            "tool_calls": today_tool_calls,
+        },
+        "week": {
+            "sessions": week_sessions,
+            "memories": week_memories,
+            "decisions": week_decisions,
+            "tool_calls": week_tool_calls,
+        },
     })))
 }
 
@@ -2357,7 +2588,7 @@ async fn web_projects(
         .get_project_ids()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(axum::Json(
-        serde_json::to_value(&projects).unwrap_or_default(),
+        serde_json::to_value(&projects).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
     ))
 }
 
@@ -2373,12 +2604,12 @@ async fn web_sessions(
     Query(q): Query<SessionsQuery>,
 ) -> Result<axum::Json<serde_json::Value>, StatusCode> {
     let store = state.store()?;
-    let limit = q.limit.unwrap_or(200);
+    let limit = api_limit(q.limit, 200, 1_000);
     let sessions = store
         .search_sessions(q.agent.as_deref(), q.project.as_deref(), None, limit)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(axum::Json(
-        serde_json::to_value(&sessions).unwrap_or_default(),
+        serde_json::to_value(&sessions).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
     ))
 }
 
@@ -2387,13 +2618,10 @@ async fn web_session_detail(
     AxumPath(id): AxumPath<String>,
 ) -> Result<axum::Json<serde_json::Value>, StatusCode> {
     let store = state.store()?;
-    let sessions = store
-        .search_sessions(None, None, None, 10_000)
+    let session = store
+        .get_session(&id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    let session = sessions
-        .into_iter()
-        .find(|s| s.id == id)
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let session = session.ok_or(StatusCode::NOT_FOUND)?;
     let tool_calls = store
         .get_tool_calls_for_session(&id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -2406,6 +2634,7 @@ async fn web_session_detail(
 #[derive(serde::Deserialize)]
 struct MemoriesQuery {
     project: Option<String>,
+    tag: Option<String>,
     limit: Option<usize>,
 }
 
@@ -2414,12 +2643,36 @@ async fn web_memories(
     Query(q): Query<MemoriesQuery>,
 ) -> Result<axum::Json<serde_json::Value>, StatusCode> {
     let store = state.store()?;
-    let memories = store
-        .get_memories(q.project.as_deref(), q.limit.unwrap_or(200))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(axum::Json(
-        serde_json::to_value(&memories).unwrap_or_default(),
-    ))
+    let limit = api_limit(q.limit, 200, 1_000);
+    let memories = if let Some(tag) = q.tag.as_deref() {
+        store
+            .search_memories_by_tag(tag, limit)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .into_iter()
+            .filter(|memory| {
+                q.project
+                    .as_deref()
+                    .is_none_or(|project| memory.project_id.as_deref() == Some(project))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        store
+            .get_memories(q.project.as_deref(), limit)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    };
+    let mut values = serde_json::to_value(&memories)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .as_array_mut()
+        .map(std::mem::take)
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    for (memory, value) in memories.iter().zip(&mut values) {
+        let tags = store
+            .get_memory_tags(&memory.id)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        value["tags"] =
+            serde_json::to_value(tags).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    Ok(axum::Json(serde_json::Value::Array(values)))
 }
 
 #[derive(serde::Deserialize)]
@@ -2436,7 +2689,7 @@ async fn web_decisions(
         .get_decisions(q.project.as_deref(), 100)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(axum::Json(
-        serde_json::to_value(&decisions).unwrap_or_default(),
+        serde_json::to_value(&decisions).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
     ))
 }
 
@@ -2454,7 +2707,7 @@ async fn web_search_sessions(
         .search_sessions_by_summary(&sq.q)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(axum::Json(
-        serde_json::to_value(&sessions).unwrap_or_default(),
+        serde_json::to_value(&sessions).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
     ))
 }
 
@@ -2467,7 +2720,7 @@ async fn web_search_memories(
         .search_memories(&sq.q)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(axum::Json(
-        serde_json::to_value(&memories).unwrap_or_default(),
+        serde_json::to_value(&memories).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
     ))
 }
 
@@ -2487,7 +2740,7 @@ async fn web_facts(
     Query(q): Query<FactsQuery>,
 ) -> Result<axum::Json<serde_json::Value>, StatusCode> {
     let store = state.store()?;
-    let limit = q.limit.unwrap_or(100);
+    let limit = api_limit(q.limit, 100, 10_000);
     let active_only = q.active_only.unwrap_or(true);
     let facts = if active_only {
         store
@@ -2498,7 +2751,9 @@ async fn web_facts(
             .get_all_facts(q.project.as_deref(), limit)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     };
-    Ok(axum::Json(serde_json::to_value(&facts).unwrap_or_default()))
+    Ok(axum::Json(
+        serde_json::to_value(&facts).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    ))
 }
 
 async fn web_fact_history(
@@ -2514,7 +2769,7 @@ async fn web_fact_history(
         .get_fact_history(&fact.subject)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(axum::Json(
-        serde_json::to_value(&history).unwrap_or_default(),
+        serde_json::to_value(&history).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
     ))
 }
 
@@ -2571,7 +2826,7 @@ async fn web_stats_timeline(
     Query(q): Query<TimelineQuery>,
 ) -> Result<axum::Json<serde_json::Value>, StatusCode> {
     let store = state.store()?;
-    let days = q.days.unwrap_or(30);
+    let days = q.days.unwrap_or(30).clamp(1, 365);
     let timeline = store
         .get_session_timeline(days, q.agent.as_deref())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -2599,7 +2854,7 @@ async fn web_hotfiles(
     Query(q): Query<HotFilesQuery>,
 ) -> Result<axum::Json<serde_json::Value>, StatusCode> {
     let store = state.store()?;
-    let limit = q.limit.unwrap_or(20);
+    let limit = api_limit(q.limit, 20, 100);
     let files = store
         .get_hot_files(q.project.as_deref(), limit)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -2615,6 +2870,20 @@ async fn web_hotfiles(
     Ok(axum::Json(serde_json::json!(result)))
 }
 
+async fn web_attention(
+    State(state): State<Arc<WebState>>,
+) -> Result<axum::Json<serde_json::Value>, StatusCode> {
+    let store = state.store()?;
+    let items = store
+        .get_attention_items()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let total = items.len();
+    Ok(axum::Json(serde_json::json!({
+        "items": items,
+        "total": total,
+    })))
+}
+
 async fn web_search_facts(
     State(state): State<Arc<WebState>>,
     Query(sq): Query<SearchQuery>,
@@ -2623,7 +2892,9 @@ async fn web_search_facts(
     let facts = store
         .search_facts(&sq.q)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(axum::Json(serde_json::to_value(&facts).unwrap_or_default()))
+    Ok(axum::Json(
+        serde_json::to_value(&facts).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    ))
 }
 
 #[derive(serde::Deserialize)]
@@ -2637,7 +2908,7 @@ async fn web_search_xpath(
     Query(xq): Query<XPathQuery>,
 ) -> Result<axum::Json<serde_json::Value>, StatusCode> {
     let store = state.store()?;
-    let limit = xq.limit.unwrap_or(20);
+    let limit = api_limit(xq.limit, 20, 500);
 
     let parsed =
         remembrant_engine::xpath_query::parse(&xq.q).map_err(|_| StatusCode::BAD_REQUEST)?;
@@ -2683,7 +2954,7 @@ async fn web_symbols(
     Query(q): Query<SymbolsQuery>,
 ) -> Result<axum::Json<serde_json::Value>, StatusCode> {
     let store = state.store()?;
-    let limit = q.limit.unwrap_or(100);
+    let limit = api_limit(q.limit, 100, 1_000);
     let symbols = if let (Some(file), Some(project)) = (&q.file, &q.project) {
         store
             .get_symbols_in_file(file, project)
@@ -2697,7 +2968,7 @@ async fn web_symbols(
         return Err(StatusCode::BAD_REQUEST);
     };
     Ok(axum::Json(
-        serde_json::to_value(&symbols).unwrap_or_default(),
+        serde_json::to_value(&symbols).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
     ))
 }
 
@@ -2710,7 +2981,7 @@ async fn web_graph_neighbors(
         .query_graph_neighbors(&id, None)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(axum::Json(
-        serde_json::to_value(&neighbors).unwrap_or_default(),
+        serde_json::to_value(&neighbors).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
     ))
 }
 
@@ -2720,6 +2991,7 @@ async fn web_graph_neighbors(
 struct UpdateMemoryBody {
     content: Option<String>,
     confidence: Option<f32>,
+    tags: Option<Vec<String>>,
 }
 
 async fn web_update_memory(
@@ -2728,14 +3000,43 @@ async fn web_update_memory(
     AxumJson(body): AxumJson<UpdateMemoryBody>,
 ) -> Result<axum::Json<serde_json::Value>, StatusCode> {
     let store = state.store()?;
+    if body
+        .content
+        .as_deref()
+        .is_some_and(|content| content.trim().is_empty())
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
     let updated = store
         .update_memory(&id, body.content.as_deref(), body.confidence)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    if updated {
-        Ok(axum::Json(serde_json::json!({"ok": true})))
-    } else {
-        Err(StatusCode::NOT_FOUND)
+    if !updated {
+        return Err(StatusCode::NOT_FOUND);
     }
+
+    if let Some(tags) = &body.tags {
+        store
+            .set_memory_tags(&id, tags)
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    }
+    Ok(axum::Json(serde_json::json!({"ok": true})))
+}
+
+async fn web_get_memory(
+    State(state): State<Arc<WebState>>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<axum::Json<serde_json::Value>, StatusCode> {
+    let store = state.store()?;
+    let memory = store
+        .get_memory(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let tags = store
+        .get_memory_tags(&id)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let mut value = serde_json::to_value(memory).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    value["tags"] = serde_json::to_value(tags).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(axum::Json(value))
 }
 
 async fn web_delete_memory(
@@ -2772,6 +3073,7 @@ async fn web_delete_fact(
 struct CreateNoteBody {
     text: String,
     project: Option<String>,
+    tags: Option<Vec<String>>,
 }
 
 async fn web_create_note(
@@ -2779,12 +3081,19 @@ async fn web_create_note(
     AxumJson(body): AxumJson<CreateNoteBody>,
 ) -> Result<(StatusCode, axum::Json<serde_json::Value>), StatusCode> {
     let store = state.store()?;
+    if body.text.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let tags = body.tags.clone().unwrap_or_default();
     let id = store
-        .insert_note(&body.text, body.project.as_deref())
+        .insert_note_with_tags(&body.text, body.project.as_deref(), &tags)
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let tags = store
+        .get_memory_tags(&id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok((
         StatusCode::CREATED,
-        axum::Json(serde_json::json!({"id": id})),
+        axum::Json(serde_json::json!({"id": id, "tags": tags})),
     ))
 }
 
@@ -2801,6 +3110,10 @@ async fn web_create_decision(
     AxumJson(body): AxumJson<CreateDecisionBody>,
 ) -> Result<(StatusCode, axum::Json<serde_json::Value>), StatusCode> {
     use remembrant_engine::store::Decision;
+
+    if body.what.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
 
     let id = uuid::Uuid::new_v4().to_string();
     let now = chrono::Utc::now().naive_utc();
@@ -2826,16 +3139,197 @@ async fn web_create_decision(
     ))
 }
 
+async fn web_briefing(
+    State(state): State<Arc<WebState>>,
+) -> Result<axum::Json<serde_json::Value>, StatusCode> {
+    let store = state.store()?;
+    let map_store_error = |_| StatusCode::INTERNAL_SERVER_ERROR;
+    let now = chrono::Utc::now().naive_utc();
+    let today_start = now.date().and_hms_opt(0, 0, 0).unwrap_or(now);
+    let yesterday_start = (now - chrono::Duration::days(1))
+        .date()
+        .and_hms_opt(0, 0, 0)
+        .unwrap_or(now);
+
+    // Current (today) counts
+    let cur_sessions = store
+        .count_sessions_since(today_start)
+        .map_err(map_store_error)?;
+    let cur_memories = store
+        .count_memories_since(today_start)
+        .map_err(map_store_error)?;
+    let cur_decisions = store
+        .count_decisions_since(today_start)
+        .map_err(map_store_error)?;
+    let recent_sessions = store
+        .get_recent_sessions_for_briefing()
+        .map_err(map_store_error)?;
+    let cur_tokens: i64 = recent_sessions
+        .iter()
+        .filter(|s| s.started_at.map(|t| t >= today_start).unwrap_or(false))
+        .filter_map(|s| s.total_tokens)
+        .map(|t| t as i64)
+        .sum();
+
+    // Previous (yesterday) counts
+    let prev_sessions = store
+        .count_sessions_since(yesterday_start)
+        .map_err(map_store_error)?
+        .saturating_sub(cur_sessions);
+    let prev_memories = store
+        .count_memories_since(yesterday_start)
+        .map_err(map_store_error)?
+        .saturating_sub(cur_memories);
+    let prev_decisions = store
+        .count_decisions_since(yesterday_start)
+        .map_err(map_store_error)?
+        .saturating_sub(cur_decisions);
+    let prev_tokens: i64 = recent_sessions
+        .iter()
+        .filter(|s| {
+            s.started_at
+                .map(|t| t >= yesterday_start && t < today_start)
+                .unwrap_or(false)
+        })
+        .filter_map(|s| s.total_tokens)
+        .map(|t| t as i64)
+        .sum();
+
+    let trend = |current: f64, previous: f64| -> f64 {
+        if previous == 0.0 {
+            if current > 0.0 { 100.0 } else { 0.0 }
+        } else {
+            ((current - previous) / previous * 100.0 * 10.0).round() / 10.0
+        }
+    };
+
+    // Active agents & projects today
+    let active_agents = store
+        .get_active_agents_since(today_start)
+        .map_err(map_store_error)?;
+    let projects_today: Vec<String> = recent_sessions
+        .iter()
+        .filter(|s| s.started_at.map(|t| t >= today_start).unwrap_or(false))
+        .filter_map(|s| s.project_id.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    // Headline
+    let sess_trend_pct = trend(cur_sessions as f64, prev_sessions as f64);
+    let trend_word = if sess_trend_pct > 0.0 {
+        format!("up {sess_trend_pct:.0}%")
+    } else if sess_trend_pct < 0.0 {
+        format!("down {:.0}%", sess_trend_pct.abs())
+    } else {
+        "unchanged".to_string()
+    };
+    let headline = format!(
+        "{} made {} session(s) across {} project(s) today, {} from yesterday",
+        if active_agents.is_empty() {
+            "Agents".to_string()
+        } else if active_agents.len() == 1 {
+            active_agents[0].clone()
+        } else {
+            format!("{} agents", active_agents.join(", "))
+        },
+        cur_sessions,
+        projects_today.len(),
+        trend_word,
+    );
+
+    // Sparklines (last 7 days)
+    let spark_sessions = store.get_daily_session_counts(6).map_err(map_store_error)?;
+    let spark_memories = store.get_daily_memory_counts(6).map_err(map_store_error)?;
+    let spark_decisions = store
+        .get_daily_decision_counts(6)
+        .map_err(map_store_error)?;
+
+    // Project breakdown
+    let project_breakdown: Vec<serde_json::Value> = store
+        .get_project_breakdown_today()
+        .map_err(map_store_error)?;
+
+    // Decisions today
+    let decisions_today = store.get_decisions_today().map_err(map_store_error)?;
+
+    // New facts
+    let new_facts = store.get_new_facts_today().map_err(map_store_error)?;
+
+    // Top files
+    let top_files: Vec<serde_json::Value> = store
+        .get_top_files_today(10)
+        .map_err(map_store_error)?
+        .into_iter()
+        .map(|(path, changes)| serde_json::json!({"file_path": path, "change_frequency": changes}))
+        .collect();
+
+    // Session summaries
+    let session_summaries = store
+        .get_session_summaries_today()
+        .map_err(map_store_error)?;
+
+    let date_str = format!(
+        "{}-{:02}-{:02}",
+        now.date().year(),
+        now.date().month(),
+        now.date().day()
+    );
+
+    // Top projects (limited to 5)
+    let top_projects = &project_breakdown[..std::cmp::min(5, project_breakdown.len())];
+
+    Ok(axum::Json(serde_json::json!({
+        "headline": headline,
+        "date": date_str,
+        "period": "today",
+        "metrics": {
+            "sessions": {
+                "current": cur_sessions,
+                "previous": prev_sessions,
+                "trend": trend(cur_sessions as f64, prev_sessions as f64),
+            },
+            "memories": {
+                "current": cur_memories,
+                "previous": prev_memories,
+                "trend": trend(cur_memories as f64, prev_memories as f64),
+            },
+            "decisions": {
+                "current": cur_decisions,
+                "previous": prev_decisions,
+                "trend": trend(cur_decisions as f64, prev_decisions as f64),
+            },
+            "tokens": {
+                "current": cur_tokens,
+                "previous": prev_tokens,
+                "trend": trend(cur_tokens as f64, prev_tokens as f64),
+            },
+        },
+        "sparklines": {
+            "sessions": spark_sessions,
+            "memories": spark_memories,
+            "decisions": spark_decisions,
+        },
+        "active_agents": active_agents,
+        "top_projects": top_projects,
+        "recent_decisions": &decisions_today,
+        "project_breakdown": &project_breakdown,
+        "decisions_today": &decisions_today,
+        "new_facts": new_facts,
+        "top_files": top_files,
+        "session_summaries": session_summaries,
+    })))
+}
+
 fn cmd_mcp() -> Result<()> {
     let config = AppConfig::load()?;
     let db_path = expand_tilde(&config.storage.duckdb_path);
 
     if !db_path.exists() {
-        eprintln!(
+        anyhow::bail!(
             "Database not found at {}. Run 'rem ingest' first.",
             db_path.display()
         );
-        std::process::exit(1);
     }
 
     let store = DuckStore::open(&db_path)?;
@@ -2862,6 +3356,8 @@ async fn cmd_web(port: u16) -> Result<()> {
 
     let app = Router::new()
         .route("/", get(web_index))
+        .route("/assets/dashboard.css", get(web_dashboard_css))
+        .route("/assets/dashboard.js", get(web_dashboard_js))
         .route("/api/stats", get(web_stats))
         .route("/api/projects", get(web_projects))
         .route("/api/sessions", get(web_sessions))
@@ -2880,6 +3376,7 @@ async fn cmd_web(port: u16) -> Result<()> {
         .route("/api/stats/tools", get(web_stats_tools))
         .route("/api/stats/timeline", get(web_stats_timeline))
         .route("/api/hotfiles", get(web_hotfiles))
+        .route("/api/attention", get(web_attention))
         .route("/api/search/facts", get(web_search_facts))
         .route("/api/search/xpath", get(web_search_xpath))
         .route("/api/symbols", get(web_symbols))
@@ -2887,11 +3384,13 @@ async fn cmd_web(port: u16) -> Result<()> {
         // Mutation endpoints
         .route(
             "/api/memories/{id}",
-            put(web_update_memory).delete(web_delete_memory),
+            get(web_get_memory)
+                .put(web_update_memory)
+                .delete(web_delete_memory),
         )
         .route("/api/facts/{id}", delete(web_delete_fact))
         .route("/api/notes", post(web_create_note))
-        .layer(CorsLayer::permissive())
+        .route("/api/briefing", get(web_briefing))
         .with_state(state);
 
     let addr = format!("127.0.0.1:{port}");
@@ -3050,4 +3549,47 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_handles_unicode_and_small_limits() {
+        assert_eq!(truncate("🔐🔐🔐🔐🔐", 4), "🔐...");
+        assert_eq!(truncate("🔐", 1), "🔐");
+        assert_eq!(truncate("unchanged", 20), "unchanged");
+    }
+
+    #[test]
+    fn utc_day_start_uses_midnight_not_rolling_hours() {
+        let timestamp =
+            NaiveDateTime::parse_from_str("2026-08-22 00:00:01", "%Y-%m-%d %H:%M:%S").unwrap();
+        assert_eq!(
+            utc_day_start(timestamp),
+            NaiveDateTime::parse_from_str("2026-08-22 00:00:00", "%Y-%m-%d %H:%M:%S").unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_since_accepts_rfc3339_offsets() {
+        let parsed = parse_since("2026-08-21T20:00:00-04:00").unwrap();
+        assert_eq!(
+            parsed,
+            NaiveDateTime::parse_from_str("2026-08-22 00:00:00", "%Y-%m-%d %H:%M:%S").unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_since_rejects_out_of_range_relative_values() {
+        assert!(parse_since("999999999999d").is_none());
+    }
+
+    #[test]
+    fn api_limits_are_bounded() {
+        assert_eq!(api_limit(None, 20, 100), 20);
+        assert_eq!(api_limit(Some(0), 20, 100), 1);
+        assert_eq!(api_limit(Some(999), 20, 100), 100);
+    }
 }

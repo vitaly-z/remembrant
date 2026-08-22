@@ -21,18 +21,35 @@ use remembrant_engine::store::duckdb::{DuckStore, Fact};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+const MCP_PROTOCOL_VERSION: &str = "2026-07-28";
+const LEGACY_MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+const DISCOVER_CACHE_TTL_MS: u64 = 3_600_000;
+const TOOL_LIST_CACHE_TTL_MS: u64 = 300_000;
+const PROTOCOL_VERSION_META_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+const SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
+
+fn server_info_meta() -> Value {
+    serde_json::json!({
+        SERVER_INFO_META_KEY: {
+            "name": "remembrant",
+            "version": env!("CARGO_PKG_VERSION"),
+        }
+    })
+}
+
 // ---------------------------------------------------------------------------
 // JSON-RPC 2.0 types
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
-    #[allow(dead_code)]
     jsonrpc: String,
     id: Option<Value>,
     method: String,
     #[serde(default)]
     params: Value,
+    #[serde(default)]
+    _meta: Value,
 }
 
 #[derive(Debug, Serialize)]
@@ -49,6 +66,8 @@ struct JsonRpcResponse {
 struct JsonRpcError {
     code: i64,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
 }
 
 // ---------------------------------------------------------------------------
@@ -65,6 +84,9 @@ struct McpTool {
 
 #[derive(Debug, Serialize)]
 struct McpToolResult {
+    #[serde(rename = "resultType")]
+    result_type: &'static str,
+    _meta: Value,
     content: Vec<McpContent>,
     #[serde(rename = "isError", skip_serializing_if = "Option::is_none")]
     is_error: Option<bool>,
@@ -83,6 +105,20 @@ struct McpContent {
 
 pub struct McpServer {
     store: DuckStore,
+}
+
+fn requested_protocol_version(req: &JsonRpcRequest) -> Option<&str> {
+    request_metadata(req)
+        .get(PROTOCOL_VERSION_META_KEY)?
+        .as_str()
+}
+
+/// Return MCP request metadata.
+///
+/// MCP 2026 places `_meta` inside JSON-RPC `params`. Top-level metadata is
+/// accepted as a compatibility fallback for early pre-final clients.
+fn request_metadata(req: &JsonRpcRequest) -> &Value {
+    req.params.get("_meta").unwrap_or(&req._meta)
 }
 
 impl McpServer {
@@ -111,6 +147,7 @@ impl McpServer {
                         error: Some(JsonRpcError {
                             code: -32700,
                             message: format!("Parse error: {e}"),
+                            data: None,
                         }),
                     };
                     writeln!(stdout, "{}", serde_json::to_string(&error_resp)?)?;
@@ -118,6 +155,28 @@ impl McpServer {
                     continue;
                 }
             };
+
+            // JSON-RPC notifications (including legacy MCP `initialized`) have
+            // no `id` and MUST not produce a response.
+            if request.id.is_none() {
+                continue;
+            }
+
+            if request.jsonrpc != "2.0" {
+                let error_resp = JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id: request.id.unwrap_or(Value::Null),
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32600,
+                        message: "Invalid Request: jsonrpc must be \"2.0\"".into(),
+                        data: None,
+                    }),
+                };
+                writeln!(stdout, "{}", serde_json::to_string(&error_resp)?)?;
+                stdout.flush()?;
+                continue;
+            }
 
             let response = self.handle_request(&request);
 
@@ -131,22 +190,65 @@ impl McpServer {
     fn handle_request(&self, req: &JsonRpcRequest) -> JsonRpcResponse {
         let id = req.id.clone().unwrap_or(Value::Null);
 
-        match req.method.as_str() {
-            "initialize" => self.handle_initialize(id),
-            "initialized" => JsonRpcResponse {
+        // Absent top-level `_meta` selects legacy initialize semantics. Once
+        // modern metadata is present, its required MCP fields must be valid.
+        let metadata = request_metadata(req);
+        if !metadata.is_null() {
+            let valid_metadata = metadata.as_object().is_some_and(|metadata| {
+                metadata
+                    .get(PROTOCOL_VERSION_META_KEY)
+                    .is_some_and(Value::is_string)
+                    && metadata
+                        .get("io.modelcontextprotocol/clientCapabilities")
+                        .is_some_and(Value::is_object)
+            });
+            if !valid_metadata {
+                return JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: None,
+                    error: Some(JsonRpcError {
+                        code: -32602,
+                        message: "Invalid modern MCP request metadata".into(),
+                        data: None,
+                    }),
+                };
+            }
+        }
+
+        if let Some(version) = requested_protocol_version(req)
+            && version != MCP_PROTOCOL_VERSION
+        {
+            return JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
-                result: Some(Value::Null),
-                error: None,
-            },
+                result: None,
+                error: Some(JsonRpcError {
+                    code: -32022,
+                    message: "Unsupported protocol version".into(),
+                    data: Some(serde_json::json!({
+                        "supported": [MCP_PROTOCOL_VERSION],
+                        "requested": version,
+                    })),
+                }),
+            };
+        }
+
+        match req.method.as_str() {
+            "initialize" => self.handle_initialize(id, &req.params),
+            "server/discover" => self.handle_discover(id),
             "tools/list" => self.handle_tools_list(id),
             "tools/call" => self.handle_tools_call(id, &req.params),
-            "ping" => JsonRpcResponse {
-                jsonrpc: "2.0",
-                id,
-                result: Some(Value::Object(serde_json::Map::new())),
-                error: None,
-            },
+            "ping" => {
+                let mut result = serde_json::Map::new();
+                result.insert("resultType".into(), Value::String("complete".into()));
+                JsonRpcResponse {
+                    jsonrpc: "2.0",
+                    id,
+                    result: Some(Value::Object(result)),
+                    error: None,
+                }
+            }
             _ => JsonRpcResponse {
                 jsonrpc: "2.0",
                 id,
@@ -154,6 +256,7 @@ impl McpServer {
                 error: Some(JsonRpcError {
                     code: -32601,
                     message: format!("Method not found: {}", req.method),
+                    data: None,
                 }),
             },
         }
@@ -163,9 +266,22 @@ impl McpServer {
     // Protocol handlers
     // -----------------------------------------------------------------------
 
-    fn handle_initialize(&self, id: Value) -> JsonRpcResponse {
+    fn handle_initialize(&self, id: Value, params: &Value) -> JsonRpcResponse {
+        // Legacy clients select a protocol version during initialize. This
+        // dual-era server keeps support for the original wire shape while all
+        // modern requests use `server/discover` and per-request `_meta`.
+        let requested = params
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .unwrap_or(LEGACY_MCP_PROTOCOL_VERSION);
+        let negotiated = if requested == MCP_PROTOCOL_VERSION {
+            MCP_PROTOCOL_VERSION
+        } else {
+            LEGACY_MCP_PROTOCOL_VERSION
+        };
+
         let result = serde_json::json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": negotiated,
             "serverInfo": {
                 "name": "remembrant",
                 "version": env!("CARGO_PKG_VERSION"),
@@ -176,6 +292,31 @@ impl McpServer {
                 },
             },
         });
+
+        JsonRpcResponse {
+            jsonrpc: "2.0",
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    fn handle_discover(&self, id: Value) -> JsonRpcResponse {
+        let mut result = serde_json::json!({
+            "resultType": "complete",
+            "supportedVersions": [MCP_PROTOCOL_VERSION],
+            "capabilities": {
+                "tools": {
+                    "listChanged": false,
+                },
+            },
+            "instructions": "Remembrant provides durable, searchable memory across coding agents. \
+                Use mem_search for broad recall, mem_recall for details, mem_xpath for structured \
+                queries, and mem_decide or mem_add to persist new knowledge.",
+            "ttlMs": DISCOVER_CACHE_TTL_MS,
+            "cacheScope": "public",
+        });
+        result["_meta"] = server_info_meta();
 
         JsonRpcResponse {
             jsonrpc: "2.0",
@@ -409,7 +550,28 @@ impl McpServer {
             },
         ];
 
-        let result = serde_json::json!({ "tools": tools });
+        // Stable ordering and an explicit JSON Schema dialect make the list
+        // deterministic and safely cacheable for MCP 2026 clients.
+        let mut tools = tools;
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        for tool in &mut tools {
+            if let Some(schema) = tool.input_schema.as_object_mut()
+                && !schema.contains_key("$schema")
+            {
+                schema.insert(
+                    "$schema".into(),
+                    Value::String("https://json-schema.org/draft/2020-12/schema".into()),
+                );
+            }
+        }
+
+        let result = serde_json::json!({
+            "resultType": "complete",
+            "tools": tools,
+            "ttlMs": TOOL_LIST_CACHE_TTL_MS,
+            "cacheScope": "public",
+            "_meta": server_info_meta(),
+        });
         JsonRpcResponse {
             jsonrpc: "2.0",
             id,
@@ -441,32 +603,60 @@ impl McpServer {
         match result {
             Ok(text) => {
                 let tool_result = McpToolResult {
+                    result_type: "complete",
+                    _meta: server_info_meta(),
                     content: vec![McpContent {
                         content_type: "text".into(),
                         text,
                     }],
                     is_error: None,
                 };
-                JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id,
-                    result: Some(serde_json::to_value(tool_result).unwrap()),
-                    error: None,
+                match serde_json::to_value(tool_result) {
+                    Ok(value) => JsonRpcResponse {
+                        jsonrpc: "2.0",
+                        id,
+                        result: Some(value),
+                        error: None,
+                    },
+                    Err(error) => JsonRpcResponse {
+                        jsonrpc: "2.0",
+                        id,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32603,
+                            message: format!("Internal serialization error: {error}"),
+                            data: None,
+                        }),
+                    },
                 }
             }
             Err(e) => {
                 let tool_result = McpToolResult {
+                    result_type: "complete",
+                    _meta: server_info_meta(),
                     content: vec![McpContent {
                         content_type: "text".into(),
                         text: format!("Error: {e}"),
                     }],
                     is_error: Some(true),
                 };
-                JsonRpcResponse {
-                    jsonrpc: "2.0",
-                    id,
-                    result: Some(serde_json::to_value(tool_result).unwrap()),
-                    error: None,
+                match serde_json::to_value(tool_result) {
+                    Ok(value) => JsonRpcResponse {
+                        jsonrpc: "2.0",
+                        id,
+                        result: Some(value),
+                        error: None,
+                    },
+                    Err(error) => JsonRpcResponse {
+                        jsonrpc: "2.0",
+                        id,
+                        result: None,
+                        error: Some(JsonRpcError {
+                            code: -32603,
+                            message: format!("Internal serialization error: {error}"),
+                            data: None,
+                        }),
+                    },
                 }
             }
         }
@@ -587,10 +777,8 @@ impl McpServer {
                     .ok_or_else(|| anyhow::anyhow!("'text' required for notes"))?;
 
                 let id = self.store.insert_note(text, project)?;
-                Ok(format!(
-                    "Note added (id: {id}): {}",
-                    &text[..text.len().min(80)]
-                ))
+                let preview: String = text.chars().take(80).collect();
+                Ok(format!("Note added (id: {id}): {preview}"))
             }
             _ => Err(anyhow::anyhow!(
                 "Unknown type: {entry_type}. Use 'fact' or 'note'."
@@ -665,6 +853,9 @@ impl McpServer {
             .get("what")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("'what' is required"))?;
+        if what.trim().is_empty() {
+            anyhow::bail!("'what' cannot be empty");
+        }
         let why = args.get("why").and_then(|v| v.as_str());
         let alternatives: Vec<String> = args
             .get("alternatives")
@@ -723,7 +914,7 @@ impl McpServer {
             }
             Ok(format!("Memory {id} updated: {}", parts.join(" and ")))
         } else {
-            Ok(format!("Memory not found: {id}"))
+            anyhow::bail!("Memory not found: {id}")
         }
     }
 
@@ -750,7 +941,7 @@ impl McpServer {
         if deleted {
             Ok(format!("{entry_type} {id} deleted"))
         } else {
-            Ok(format!("{entry_type} not found: {id}"))
+            anyhow::bail!("{entry_type} not found: {id}")
         }
     }
 
@@ -824,5 +1015,149 @@ impl McpServer {
             "Fact revised: '{} {} {}' → '{subject} {predicate} {object}' (old: {old_fact_id}, new: {new_id})",
             old_fact.subject, old_fact.predicate, old_fact.object
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(method: &str, params: Value, modern: bool) -> JsonRpcRequest {
+        let _meta = if modern {
+            serde_json::json!({
+                PROTOCOL_VERSION_META_KEY: MCP_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            })
+        } else {
+            Value::Object(serde_json::Map::new())
+        };
+        let params = if modern {
+            let mut object = params.as_object().cloned().unwrap_or_default();
+            object.insert("_meta".into(), _meta.clone());
+            Value::Object(object)
+        } else {
+            params
+        };
+
+        JsonRpcRequest {
+            jsonrpc: "2.0".into(),
+            id: Some(Value::from(1)),
+            method: method.into(),
+            params,
+            _meta: Value::Null,
+        }
+    }
+
+    #[test]
+    fn modern_discovery_is_cacheable_and_stateless() {
+        let server = McpServer::new(DuckStore::open_in_memory().expect("store"));
+        let response = server.handle_request(&request("server/discover", Value::Null, true));
+        let result = response.result.expect("discover result");
+
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["supportedVersions"][0], MCP_PROTOCOL_VERSION);
+        assert_eq!(result["ttlMs"], DISCOVER_CACHE_TTL_MS);
+        assert_eq!(result["cacheScope"], "public");
+        assert_eq!(result["_meta"][SERVER_INFO_META_KEY]["name"], "remembrant");
+        assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
+    }
+
+    #[test]
+    fn tools_list_is_deterministic_and_cacheable() {
+        let server = McpServer::new(DuckStore::open_in_memory().expect("store"));
+        let first = server.handle_request(&request("tools/list", Value::Null, true));
+        let second = server.handle_request(&request("tools/list", Value::Null, true));
+        assert_eq!(first.result, second.result);
+
+        let result = first.result.expect("tools result");
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["ttlMs"], TOOL_LIST_CACHE_TTL_MS);
+        assert_eq!(result["cacheScope"], "public");
+        let names: Vec<&str> = result["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        assert_eq!(names, sorted);
+        assert!(
+            result["tools"]
+                .as_array()
+                .expect("tools array")
+                .iter()
+                .all(|tool| tool["inputSchema"]["$schema"]
+                    .as_str()
+                    .is_some_and(|schema| schema.ends_with("2020-12/schema")))
+        );
+    }
+
+    #[test]
+    fn unsupported_modern_version_returns_supported_versions() {
+        let server = McpServer::new(DuckStore::open_in_memory().expect("store"));
+        let mut req = request("tools/list", Value::Null, true);
+        req.params["_meta"][PROTOCOL_VERSION_META_KEY] = Value::String("1900-01-01".into());
+        let response = server.handle_request(&req);
+
+        let error = response.error.expect("version error");
+        assert_eq!(error.code, -32022);
+        assert_eq!(
+            error.data.expect("version data")["supported"][0],
+            MCP_PROTOCOL_VERSION
+        );
+    }
+
+    #[test]
+    fn malformed_modern_metadata_is_rejected() {
+        let server = McpServer::new(DuckStore::open_in_memory().expect("store"));
+        let mut req = request("tools/list", Value::Null, true);
+        req.params
+            .get_mut("_meta")
+            .and_then(Value::as_object_mut)
+            .expect("metadata object")
+            .remove("io.modelcontextprotocol/clientCapabilities");
+        let response = server.handle_request(&req);
+
+        let error = response.error.expect("metadata error");
+        assert_eq!(error.code, -32602);
+        assert!(error.message.contains("metadata"));
+    }
+
+    #[test]
+    fn legacy_initialize_remains_compatible() {
+        let server = McpServer::new(DuckStore::open_in_memory().expect("store"));
+        let params = serde_json::json!({"protocolVersion": LEGACY_MCP_PROTOCOL_VERSION});
+        let response = server.handle_request(&request("initialize", params, false));
+        let result = response.result.expect("initialize result");
+
+        assert_eq!(result["protocolVersion"], LEGACY_MCP_PROTOCOL_VERSION);
+        assert_eq!(result["serverInfo"]["name"], "remembrant");
+        assert_eq!(result["capabilities"]["tools"]["listChanged"], false);
+    }
+
+    #[test]
+    fn tool_call_add_note_handles_unicode_without_panicking() {
+        let store = DuckStore::open_in_memory().expect("store");
+        let server = McpServer::new(store);
+        let params = serde_json::json!({
+            "name": "mem_add",
+            "arguments": {
+                "type": "note",
+                "text": "🔐 Unicode-safe MCP note",
+                "project": "mcp-tests"
+            }
+        });
+        let response = server.handle_request(&request("tools/call", params, true));
+        let result = response.result.expect("tool result");
+
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["isError"], Value::Null);
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .expect("tool text")
+                .contains("Unicode-safe MCP note")
+        );
     }
 }

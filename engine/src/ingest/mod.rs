@@ -2,6 +2,7 @@ pub mod adapter;
 pub mod claude;
 pub mod codex;
 pub mod gemini;
+pub mod jsonl_adapter;
 pub mod native_adapters;
 #[cfg(feature = "sqlite-adapters")]
 pub mod sqlite_adapter;
@@ -12,7 +13,10 @@ pub use adapter::{AdapterRegistry, AgentAdapter, AgentMeta, DynamicAgentConfig, 
 pub use claude::ClaudeIngester;
 pub use codex::CodexIngester;
 pub use gemini::GeminiIngester;
-pub use native_adapters::{ClaudeAdapter, CodexAdapter, GeminiAdapter, build_default_registry};
+pub use jsonl_adapter::GenericJsonlAdapter;
+pub use native_adapters::{
+    ClaudeAdapter, CodexAdapter, GeminiAdapter, build_default_registry, build_registry_from_config,
+};
 #[cfg(feature = "sqlite-adapters")]
 pub use sqlite_adapter::GenericSqliteAdapter;
 

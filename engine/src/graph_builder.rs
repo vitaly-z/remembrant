@@ -34,6 +34,8 @@ pub trait GraphBackend {
     fn get_node(&self, id: &str) -> Result<Option<(String, String, String, String)>>; // (id, kind, name, props)
     fn delete_node(&self, id: &str) -> Result<bool>;
     fn query_neighbors(&self, id: &str, edge_kind: Option<&str>) -> Result<Vec<NeighborInfo>>;
+    /// Return all graph nodes as `(id, kind, name, JSON properties)`.
+    fn all_nodes(&self) -> Result<Vec<(String, String, String, String)>>;
     fn node_count(&self) -> Result<usize>;
     fn edge_count(&self) -> Result<usize>;
 }
@@ -141,6 +143,20 @@ impl GraphBackend for GraphStore {
             .collect())
     }
 
+    fn all_nodes(&self) -> Result<Vec<(String, String, String, String)>> {
+        Ok(GraphStore::all_nodes(self)?
+            .into_iter()
+            .map(|node| {
+                (
+                    node.id,
+                    node.kind.table_name().to_string(),
+                    node.name,
+                    props_to_json(&node.properties),
+                )
+            })
+            .collect())
+    }
+
     fn node_count(&self) -> Result<usize> {
         GraphStoreBackend::node_count(self)
     }
@@ -187,6 +203,14 @@ impl GraphBackend for DuckStore {
             .collect())
     }
 
+    fn all_nodes(&self) -> Result<Vec<(String, String, String, String)>> {
+        Ok(self
+            .list_graph_nodes()?
+            .into_iter()
+            .map(|node| (node.id, node.kind, node.name, node.properties))
+            .collect())
+    }
+
     fn node_count(&self) -> Result<usize> {
         self.count_graph_nodes()
     }
@@ -224,6 +248,15 @@ impl GraphBackend for &DuckStore {
             })
             .collect())
     }
+
+    fn all_nodes(&self) -> Result<Vec<(String, String, String, String)>> {
+        Ok((*self)
+            .list_graph_nodes()?
+            .into_iter()
+            .map(|node| (node.id, node.kind, node.name, node.properties))
+            .collect())
+    }
+
     fn node_count(&self) -> Result<usize> {
         (*self).count_graph_nodes()
     }

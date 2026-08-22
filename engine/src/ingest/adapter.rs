@@ -211,7 +211,7 @@ pub struct DynamicAgentConfig {
     pub enabled: bool,
     /// Base path to the agent's data directory (supports `~`).
     pub path: String,
-    /// Adapter type: "sqlite", "jsonl", "json", "markdown".
+    /// Adapter type: `"sqlite"` or `"jsonl"`; unsupported values are rejected.
     pub adapter_type: String,
     /// For SQLite adapters: table/column mappings.
     #[serde(default)]
@@ -488,7 +488,7 @@ sqlite:
     content: messages
     timestamp_format: iso8601
 "#;
-        let config: DynamicAgentConfig = serde_yaml::from_str(yaml).unwrap();
+        let config: DynamicAgentConfig = serde_norway::from_str(yaml).unwrap();
         assert_eq!(config.id, "goose");
         assert!(config.enabled);
         assert!(config.sqlite.is_some());

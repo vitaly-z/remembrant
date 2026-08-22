@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use std::time::Duration;
+use tracing::{debug, info};
 
 // ---------------------------------------------------------------------------
 // Provider trait
@@ -68,13 +69,17 @@ impl LmStudioEmbedder {
             base_url: base_url.trim_end_matches('/').to_string(),
             model: model.to_string(),
             dimensions,
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(5))
+                .timeout(Duration::from_secs(120))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
         }
     }
 
     /// Build an embedder from the application's [`EmbeddingConfig`](crate::config::EmbeddingConfig).
     pub fn from_config(config: &crate::config::EmbeddingConfig) -> Self {
-        Self::new(&config.model, config.dimensions)
+        Self::with_base_url(&config.endpoint, &config.model, config.dimensions)
     }
 }
 
@@ -134,10 +139,16 @@ impl EmbedProvider for LmStudioEmbedder {
             .collect();
 
         if vectors.len() != texts.len() {
-            warn!(
-                expected = texts.len(),
-                got = vectors.len(),
-                "LM Studio returned a different number of embeddings than requested"
+            anyhow::bail!(
+                "LM Studio returned {} embeddings for {} inputs",
+                vectors.len(),
+                texts.len()
+            );
+        }
+        if vectors.iter().any(|vector| vector.len() != self.dimensions) {
+            anyhow::bail!(
+                "LM Studio returned an embedding with dimensions other than {}",
+                self.dimensions
             );
         }
 
@@ -266,13 +277,13 @@ mod tests {
     fn test_from_config() {
         let config = crate::config::EmbeddingConfig {
             model: "test-model".to_string(),
-            api_key_env: String::new(),
+            endpoint: "http://127.0.0.1:9999/v1/".to_string(),
             batch_size: 50,
             dimensions: 384,
         };
         let embedder = LmStudioEmbedder::from_config(&config);
         assert_eq!(embedder.model_name(), "test-model");
         assert_eq!(embedder.dimensions(), 384);
-        assert_eq!(embedder.base_url, "http://localhost:1234/v1");
+        assert_eq!(embedder.base_url, "http://127.0.0.1:9999/v1");
     }
 }

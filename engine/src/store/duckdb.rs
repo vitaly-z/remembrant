@@ -4,6 +4,7 @@ use duckdb::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Mutex;
+use tracing::warn;
 
 // ---------------------------------------------------------------------------
 // Domain structs
@@ -151,6 +152,42 @@ fn json_to_vec(s: &str) -> Vec<String> {
     serde_json::from_str(s).unwrap_or_default()
 }
 
+/// Delete a graph node and incident edges before a relational transaction.
+///
+/// DuckDB's foreign-key implementation can reject a parent-node deletion in
+/// the same transaction that removes its child edges. Graph cleanup is therefore
+/// committed first; callers rebuild derived graph nodes after relational writes.
+fn delete_graph_node_with_edges(conn: &mut duckdb::Connection, node_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM graph_edges WHERE from_id = ? OR to_id = ?",
+        params![node_id, node_id],
+    )
+    .context("failed to delete graph edges")?;
+    conn.execute("DELETE FROM graph_nodes WHERE id = ?", params![node_id])
+        .context("failed to delete graph node")?;
+    Ok(())
+}
+
+fn normalize_tags(tags: &[String]) -> Result<Vec<String>> {
+    let mut normalized = Vec::new();
+    for tag in tags {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            anyhow::bail!("tags cannot be empty");
+        }
+        if tag.len() > 80 {
+            anyhow::bail!("tag exceeds 80 characters: {tag}");
+        }
+        if !normalized
+            .iter()
+            .any(|existing: &String| existing.eq_ignore_ascii_case(tag))
+        {
+            normalized.push(tag.to_string());
+        }
+    }
+    Ok(normalized)
+}
+
 // ---------------------------------------------------------------------------
 // Graph row structs (for DuckPGQ-backed graph storage)
 // ---------------------------------------------------------------------------
@@ -266,6 +303,14 @@ impl DuckStore {
                 created_at TIMESTAMP DEFAULT current_timestamp,
                 updated_at TIMESTAMP DEFAULT current_timestamp,
                 valid_until TIMESTAMP
+            );
+
+            CREATE TABLE IF NOT EXISTS memory_tags (
+                memory_id TEXT NOT NULL,
+                tag TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT current_timestamp,
+                PRIMARY KEY (memory_id, tag),
+                FOREIGN KEY (memory_id) REFERENCES memories(id)
             );
 
             CREATE TABLE IF NOT EXISTS tool_calls (
@@ -736,37 +781,101 @@ impl DuckStore {
         Ok(())
     }
 
-    /// Insert or replace a session record (upsert).
+    /// Replace a session and its transcript-derived relational rows.
     ///
-    /// If a session with the same `id` already exists, it is replaced with
-    /// the new data. This makes re-ingestion idempotent.
+    /// Re-ingestion is idempotent. DuckDB cannot reliably delete graph parent
+    /// nodes and child edges in one transaction, so stale derived graph nodes
+    /// are removed first; callers rebuild the graph after successful writes.
     pub fn insert_or_replace_session(&self, session: &Session) -> Result<()> {
-        let conn = self.conn.lock().expect("lock poisoned");
+        let mut conn = self.conn.lock().expect("lock poisoned");
         let files_json = vec_to_json(&session.files_changed);
+
+        let stale_graph_ids: Vec<String> = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT 'session:' || ? AS graph_id
+                     UNION ALL
+                     SELECT 'memory:' || id FROM memories WHERE source_session_id = ?
+                     UNION ALL
+                     SELECT 'decision:' || id FROM decisions WHERE session_id = ?",
+                )
+                .context("failed to prepare stale graph lookup")?;
+            let rows = statement
+                .query_map(params![session.id, session.id, session.id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .context("failed to query stale graph IDs")?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(row.context("failed to read stale graph ID")?);
+            }
+            ids
+        };
+        for graph_id in &stale_graph_ids {
+            delete_graph_node_with_edges(&mut conn, graph_id)?;
+        }
         conn.execute(
-            "INSERT OR REPLACE INTO sessions (
-                id, project_id, agent, started_at, ended_at,
-                duration_minutes, message_count, tool_call_count,
-                total_tokens, files_changed, summary
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            params![
-                session.id,
-                session.project_id,
-                session.agent,
-                session.started_at,
-                session.ended_at,
-                session.duration_minutes,
-                session.message_count,
-                session.tool_call_count,
-                session.total_tokens,
-                files_json,
-                session.summary,
-            ],
+            "DELETE FROM memory_tags WHERE memory_id IN (
+                SELECT id FROM memories WHERE source_session_id = ?
+            )",
+            params![session.id],
         )
-        .context("failed to insert_or_replace session")?;
+        .context("failed to delete old session memory tags")?;
+
+        let transaction = conn
+            .transaction()
+            .context("failed to begin session replacement transaction")?;
+        transaction
+            .execute(
+                "DELETE FROM tool_calls WHERE session_id = ?",
+                params![session.id],
+            )
+            .context("failed to delete old session tool calls")?;
+        transaction
+            .execute(
+                "DELETE FROM memories WHERE source_session_id = ?",
+                params![session.id],
+            )
+            .context("failed to delete old session memories")?;
+        transaction
+            .execute(
+                "DELETE FROM decisions WHERE session_id = ?",
+                params![session.id],
+            )
+            .context("failed to delete old session decisions")?;
+        transaction
+            .execute(
+                "DELETE FROM facts WHERE source_session_id = ?",
+                params![session.id],
+            )
+            .context("failed to delete old session facts")?;
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO sessions (
+                    id, project_id, agent, started_at, ended_at,
+                    duration_minutes, message_count, tool_call_count,
+                    total_tokens, files_changed, summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    session.id,
+                    session.project_id,
+                    session.agent,
+                    session.started_at,
+                    session.ended_at,
+                    session.duration_minutes,
+                    session.message_count,
+                    session.tool_call_count,
+                    session.total_tokens,
+                    files_json,
+                    session.summary,
+                ],
+            )
+            .context("failed to insert_or_replace session")?;
+        transaction
+            .commit()
+            .context("failed to commit session replacement transaction")?;
         Ok(())
     }
-
     /// Insert a memory record.
     pub fn insert_memory(&self, memory: &Memory) -> Result<()> {
         let conn = self.conn.lock().expect("lock poisoned");
@@ -848,10 +957,22 @@ impl DuckStore {
 
     /// Delete a memory by ID.
     pub fn delete_memory(&self, memory_id: &str) -> Result<bool> {
-        let conn = self.conn.lock().expect("lock poisoned");
-        let affected = conn
+        let mut conn = self.conn.lock().expect("lock poisoned");
+        delete_graph_node_with_edges(&mut conn, &format!("memory:{memory_id}"))?;
+        conn.execute(
+            "DELETE FROM memory_tags WHERE memory_id = ?",
+            params![memory_id],
+        )
+        .context("failed to delete memory tags")?;
+        let transaction = conn
+            .transaction()
+            .context("failed to begin memory deletion transaction")?;
+        let affected = transaction
             .execute("DELETE FROM memories WHERE id = ?", params![memory_id])
             .context("failed to delete memory")?;
+        transaction
+            .commit()
+            .context("failed to commit memory deletion transaction")?;
         Ok(affected > 0)
     }
 
@@ -1406,6 +1527,43 @@ impl DuckStore {
         Ok(sessions)
     }
 
+    /// Return a session by its exact identifier.
+    pub fn get_session(&self, session_id: &str) -> Result<Option<Session>> {
+        let conn = self.conn.lock().expect("lock poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, project_id, agent, started_at, ended_at,
+                        duration_minutes, message_count, tool_call_count,
+                        total_tokens, files_changed, summary
+                 FROM sessions
+                 WHERE id = ?",
+            )
+            .context("failed to prepare get_session")?;
+
+        let mut rows = stmt
+            .query_map(params![session_id], |row| {
+                let files_str: String = row.get::<_, String>(9).unwrap_or_default();
+                Ok(Session {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    agent: row.get(2)?,
+                    started_at: row.get(3)?,
+                    ended_at: row.get(4)?,
+                    duration_minutes: row.get(5)?,
+                    message_count: row.get(6)?,
+                    tool_call_count: row.get(7)?,
+                    total_tokens: row.get(8)?,
+                    files_changed: json_to_vec(&files_str),
+                    summary: row.get(10)?,
+                })
+            })
+            .context("failed to query session by id")?;
+
+        rows.next()
+            .transpose()
+            .context("failed to read session by id")
+    }
+
     /// Search sessions by agent, project, or since date.
     pub fn search_sessions(
         &self,
@@ -1482,10 +1640,14 @@ impl DuckStore {
         Ok(sessions)
     }
 
-    /// Get sessions from today (last 24 hours).
+    /// Get all sessions from the current UTC calendar day.
     pub fn get_todays_sessions(&self) -> Result<Vec<Session>> {
-        let since = Utc::now().naive_utc() - chrono::Duration::hours(24);
-        self.search_sessions(None, None, Some(since), 1000)
+        let now = Utc::now().naive_utc();
+        let since = now
+            .date()
+            .and_hms_opt(0, 0, 0)
+            .context("failed to calculate UTC day boundary")?;
+        self.search_sessions(None, None, Some(since), i32::MAX as usize)
     }
 
     /// Get tool calls for a session.
@@ -1660,6 +1822,233 @@ impl DuckStore {
         Ok(count as usize)
     }
 
+    /// Count sessions since a given timestamp.
+    pub fn count_sessions_since(&self, since: NaiveDateTime) -> Result<usize> {
+        let conn = self.conn.lock().expect("lock poisoned");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE started_at >= ?",
+                params![since],
+                |row| row.get(0),
+            )
+            .context("failed to count sessions since")?;
+        Ok(count as usize)
+    }
+
+    /// Count memories since a given timestamp.
+    pub fn count_memories_since(&self, since: NaiveDateTime) -> Result<usize> {
+        let conn = self.conn.lock().expect("lock poisoned");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE created_at >= ?",
+                params![since],
+                |row| row.get(0),
+            )
+            .context("failed to count memories since")?;
+        Ok(count as usize)
+    }
+
+    /// Count decisions since a given timestamp.
+    pub fn count_decisions_since(&self, since: NaiveDateTime) -> Result<usize> {
+        let conn = self.conn.lock().expect("lock poisoned");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM decisions WHERE created_at >= ?",
+                params![since],
+                |row| row.get(0),
+            )
+            .context("failed to count decisions since")?;
+        Ok(count as usize)
+    }
+
+    /// Count tool calls since a given timestamp.
+    pub fn count_tool_calls_since(&self, since: NaiveDateTime) -> Result<usize> {
+        let conn = self.conn.lock().expect("lock poisoned");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_calls WHERE timestamp >= ?",
+                params![since],
+                |row| row.get(0),
+            )
+            .context("failed to count tool calls since")?;
+        Ok(count as usize)
+    }
+
+    /// Get distinct agent names active since a timestamp.
+    pub fn get_active_agents_since(&self, since: NaiveDateTime) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("lock poisoned");
+        let mut stmt = conn
+            .prepare("SELECT DISTINCT agent FROM sessions WHERE started_at >= ? ORDER BY agent")
+            .context("failed to prepare active agents since")?;
+        let rows = stmt
+            .query_map(params![since], |row| row.get::<_, String>(0))
+            .context("failed to query active agents since")?;
+        let mut agents = Vec::new();
+        for row in rows {
+            agents.push(row.context("failed to read agent row")?);
+        }
+        Ok(agents)
+    }
+
+    /// Get per-day session counts for the last N days (for sparklines).
+    pub fn get_daily_session_counts(&self, days: i64) -> Result<Vec<i64>> {
+        Ok(self
+            .get_daily_counts(days)?
+            .into_iter()
+            .map(|(_, sessions, _, _)| sessions)
+            .collect())
+    }
+
+    /// Get per-day memory counts for the last N days (for sparklines).
+    pub fn get_daily_memory_counts(&self, days: i64) -> Result<Vec<i64>> {
+        Ok(self
+            .get_daily_counts(days)?
+            .into_iter()
+            .map(|(_, _, memories, _)| memories)
+            .collect())
+    }
+
+    /// Get per-day decision counts for the last N days (for sparklines).
+    pub fn get_daily_decision_counts(&self, days: i64) -> Result<Vec<i64>> {
+        Ok(self
+            .get_daily_counts(days)?
+            .into_iter()
+            .map(|(_, _, _, decisions)| decisions)
+            .collect())
+    }
+
+    /// Returns (date_str, sessions_count, memories_count, decisions_count) for each of the last N days.
+    pub fn get_daily_counts(&self, days: i64) -> Result<Vec<(String, i64, i64, i64)>> {
+        let days = days.max(0);
+        let conn = self.conn.lock().expect("lock poisoned");
+
+        let now = Utc::now().naive_utc();
+        let today_start = now.date().and_hms_opt(0, 0, 0).context("invalid date")?;
+        let cutoff = today_start - chrono::Duration::days(days);
+
+        // Query each table separately and merge in Rust
+        let mut sess_map = std::collections::HashMap::<String, i64>::new();
+        let mut stmt = conn
+            .prepare(
+                "SELECT CAST(started_at AS DATE)::VARCHAR AS day, COUNT(*) AS cnt
+                 FROM sessions
+                 WHERE started_at >= ?
+                 GROUP BY day
+                 ORDER BY day",
+            )
+            .context("failed to prepare daily sessions count")?;
+        let rows = stmt
+            .query_map(params![cutoff], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .context("failed to query daily sessions")?;
+        for row in rows {
+            let (d, c) = row.context("failed to read session count row")?;
+            sess_map.insert(d, c);
+        }
+
+        let mut mem_map = std::collections::HashMap::<String, i64>::new();
+        let mut stmt = conn
+            .prepare(
+                "SELECT CAST(created_at AS DATE)::VARCHAR AS day, COUNT(*) AS cnt
+                 FROM memories
+                 WHERE created_at >= ?
+                 GROUP BY day
+                 ORDER BY day",
+            )
+            .context("failed to prepare daily memories count")?;
+        let rows = stmt
+            .query_map(params![cutoff], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .context("failed to query daily memories")?;
+        for row in rows {
+            let (d, c) = row.context("failed to read memory count row")?;
+            mem_map.insert(d, c);
+        }
+
+        let mut dec_map = std::collections::HashMap::<String, i64>::new();
+        let mut stmt = conn
+            .prepare(
+                "SELECT CAST(created_at AS DATE)::VARCHAR AS day, COUNT(*) AS cnt
+                 FROM decisions
+                 WHERE created_at >= ?
+                 GROUP BY day
+                 ORDER BY day",
+            )
+            .context("failed to prepare daily decisions count")?;
+        let rows = stmt
+            .query_map(params![cutoff], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .context("failed to query daily decisions")?;
+        for row in rows {
+            let (d, c) = row.context("failed to read decision count row")?;
+            dec_map.insert(d, c);
+        }
+
+        // Build ordered result for each day in the range
+        let today = now.date();
+        let mut result = Vec::new();
+        for i in (0..=days).rev() {
+            let date = today - chrono::Duration::days(i);
+            let date_str = date.format("%Y-%m-%d").to_string();
+            let s = sess_map.get(&date_str).copied().unwrap_or(0);
+            let m = mem_map.get(&date_str).copied().unwrap_or(0);
+            let d = dec_map.get(&date_str).copied().unwrap_or(0);
+            result.push((date_str, s, m, d));
+        }
+
+        Ok(result)
+    }
+
+    /// Returns sessions from today and yesterday for briefing comparison.
+    pub fn get_recent_sessions_for_briefing(&self) -> Result<Vec<Session>> {
+        let conn = self.conn.lock().expect("lock poisoned");
+
+        let now = Utc::now().naive_utc();
+        let cutoff = (now - chrono::Duration::days(1))
+            .date()
+            .and_hms_opt(0, 0, 0)
+            .context("invalid date")?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, project_id, agent, started_at, ended_at,
+                        duration_minutes, message_count, tool_call_count,
+                        total_tokens, files_changed, summary
+                 FROM sessions
+                 WHERE started_at >= ?
+                 ORDER BY started_at DESC",
+            )
+            .context("failed to prepare recent sessions for briefing")?;
+
+        let rows = stmt
+            .query_map(params![cutoff], |row| {
+                let files_str: String = row.get::<_, String>(9).unwrap_or_default();
+                Ok(Session {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    agent: row.get(2)?,
+                    started_at: row.get(3)?,
+                    ended_at: row.get(4)?,
+                    duration_minutes: row.get(5)?,
+                    message_count: row.get(6)?,
+                    tool_call_count: row.get(7)?,
+                    total_tokens: row.get(8)?,
+                    files_changed: json_to_vec(&files_str),
+                    summary: row.get(10)?,
+                })
+            })
+            .context("failed to query recent sessions for briefing")?;
+
+        let mut sessions = Vec::new();
+        for row in rows {
+            sessions.push(row.context("failed to read briefing session row")?);
+        }
+        Ok(sessions)
+    }
+
     /// Get all decisions, optionally filtered by project.
     pub fn get_decisions(&self, project: Option<&str>, limit: usize) -> Result<Vec<Decision>> {
         let conn = self.conn.lock().expect("lock poisoned");
@@ -1723,15 +2112,23 @@ impl DuckStore {
 
     /// Get all sessions for a specific project.
     pub fn get_project_sessions(&self, project_id: &str) -> Result<Vec<Session>> {
-        self.search_sessions(None, Some(project_id), None, 10_000)
+        self.search_sessions(None, Some(project_id), None, i32::MAX as usize)
     }
 
-    /// Get distinct project IDs from sessions.
+    /// Get distinct project IDs across all persisted knowledge types.
     pub fn get_project_ids(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().expect("lock poisoned");
         let mut stmt = conn
             .prepare(
-                "SELECT DISTINCT project_id FROM sessions
+                "SELECT DISTINCT project_id FROM (
+                    SELECT project_id FROM sessions
+                    UNION ALL
+                    SELECT project_id FROM memories
+                    UNION ALL
+                    SELECT project_id FROM decisions
+                    UNION ALL
+                    SELECT project_id FROM facts
+                 ) AS projects
                  WHERE project_id IS NOT NULL
                  ORDER BY project_id",
             )
@@ -1748,25 +2145,101 @@ impl DuckStore {
         Ok(ids)
     }
 
-    /// Delete a session and its related tool calls.
+    /// Delete a session and all data derived from that transcript.
+    ///
+    /// Graph cleanup is committed before relational deletion to avoid a DuckDB
+    /// foreign-key limitation around parent/child deletes in one transaction.
     pub fn delete_session(&self, session_id: &str) -> Result<bool> {
-        let conn = self.conn.lock().expect("lock poisoned");
+        let mut conn = self.conn.lock().expect("lock poisoned");
+        let stale_graph_ids: Vec<String> = {
+            let mut statement = conn
+                .prepare(
+                    "SELECT 'session:' || ? AS graph_id
+                     UNION ALL
+                     SELECT 'memory:' || id FROM memories WHERE source_session_id = ?
+                     UNION ALL
+                     SELECT 'decision:' || id FROM decisions WHERE session_id = ?",
+                )
+                .context("failed to prepare session graph lookup")?;
+            let rows = statement
+                .query_map(params![session_id, session_id, session_id], |row| {
+                    row.get::<_, String>(0)
+                })
+                .context("failed to query session graph IDs")?;
+            let mut ids = Vec::new();
+            for row in rows {
+                ids.push(row.context("failed to read session graph ID")?);
+            }
+            ids
+        };
+        for graph_id in &stale_graph_ids {
+            delete_graph_node_with_edges(&mut conn, graph_id)?;
+        }
         conn.execute(
-            "DELETE FROM tool_calls WHERE session_id = ?",
+            "DELETE FROM memory_tags WHERE memory_id IN (
+                SELECT id FROM memories WHERE source_session_id = ?
+            )",
             params![session_id],
         )
-        .context("failed to delete tool_calls for session")?;
+        .context("failed to delete session memory tags")?;
 
-        let affected = conn
+        let transaction = conn
+            .transaction()
+            .context("failed to begin session deletion transaction")?;
+        transaction
+            .execute(
+                "DELETE FROM memories WHERE source_session_id = ?",
+                params![session_id],
+            )
+            .context("failed to delete session memories")?;
+        transaction
+            .execute(
+                "DELETE FROM decisions WHERE session_id = ?",
+                params![session_id],
+            )
+            .context("failed to delete session decisions")?;
+        transaction
+            .execute(
+                "DELETE FROM facts WHERE source_session_id = ?",
+                params![session_id],
+            )
+            .context("failed to delete session facts")?;
+        transaction
+            .execute(
+                "DELETE FROM tool_calls WHERE session_id = ?",
+                params![session_id],
+            )
+            .context("failed to delete session tool calls")?;
+        let affected = transaction
             .execute("DELETE FROM sessions WHERE id = ?", params![session_id])
             .context("failed to delete session")?;
-
+        transaction
+            .commit()
+            .context("failed to commit session deletion transaction")?;
         Ok(affected > 0)
     }
-
     /// Delete old sessions before a given date. Returns number deleted.
     pub fn gc_sessions_before(&self, before: NaiveDateTime) -> Result<usize> {
         let conn = self.conn.lock().expect("lock poisoned");
+
+        // Graph session nodes are derived from sessions and must not survive
+        // retention cleanup.
+        conn.execute(
+            "DELETE FROM graph_edges
+             WHERE from_id IN (
+                    SELECT 'session:' || id FROM sessions WHERE started_at < ?
+                 ) OR to_id IN (
+                    SELECT 'session:' || id FROM sessions WHERE started_at < ?
+                 )",
+            params![before, before],
+        )
+        .context("failed to delete graph edges for old sessions")?;
+        conn.execute(
+            "DELETE FROM graph_nodes
+             WHERE id IN (SELECT 'session:' || id FROM sessions WHERE started_at < ?)",
+            params![before],
+        )
+        .context("failed to delete graph nodes for old sessions")?;
 
         // First delete tool_calls for those sessions
         conn.execute(
@@ -1784,8 +2257,30 @@ impl DuckStore {
         Ok(affected)
     }
 
+    /// Delete tool calls whose session no longer exists.
+    pub fn delete_orphaned_tool_calls(&self) -> Result<usize> {
+        let conn = self.conn.lock().expect("lock poisoned");
+        let affected = conn
+            .execute(
+                "DELETE FROM tool_calls
+                 WHERE session_id IS NOT NULL
+                   AND session_id NOT IN (SELECT id FROM sessions)",
+                [],
+            )
+            .context("failed to delete orphaned tool_calls")?;
+        Ok(affected)
+    }
+
     /// Insert a note as a memory.
     pub fn insert_note(&self, content: &str, project: Option<&str>) -> Result<String> {
+        let content = content.trim();
+        if content.is_empty() {
+            anyhow::bail!("note content cannot be empty");
+        }
+        let project = project.and_then(|project| {
+            let trimmed = project.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        });
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now().naive_utc();
         let memory = Memory {
@@ -1802,6 +2297,93 @@ impl DuckStore {
         };
         self.insert_memory(&memory)?;
         Ok(id)
+    }
+
+    /// Insert a manual note and associate normalized tags with it.
+    pub fn insert_note_with_tags(
+        &self,
+        content: &str,
+        project: Option<&str>,
+        tags: &[String],
+    ) -> Result<String> {
+        let normalized = normalize_tags(tags)?;
+        let id = self.insert_note(content, project)?;
+        self.set_memory_tags(&id, &normalized)?;
+        Ok(id)
+    }
+
+    /// Replace all tags for a memory.
+    pub fn set_memory_tags(&self, memory_id: &str, tags: &[String]) -> Result<()> {
+        let normalized = normalize_tags(tags)?;
+        let conn = self.conn.lock().expect("lock poisoned");
+        conn.execute(
+            "DELETE FROM memory_tags WHERE memory_id = ?",
+            params![memory_id],
+        )
+        .context("failed to clear memory tags")?;
+
+        let mut stmt = conn
+            .prepare("INSERT INTO memory_tags (memory_id, tag) VALUES (?, ?)")
+            .context("failed to prepare memory tag insert")?;
+        for tag in &normalized {
+            stmt.execute(params![memory_id, tag])
+                .context("failed to insert memory tags")?;
+        }
+        Ok(())
+    }
+
+    /// Return tags for a memory in stable alphabetical order.
+    pub fn get_memory_tags(&self, memory_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock().expect("lock poisoned");
+        let mut stmt = conn
+            .prepare("SELECT tag FROM memory_tags WHERE memory_id = ? ORDER BY tag")
+            .context("failed to prepare memory tag lookup")?;
+        let rows = stmt
+            .query_map(params![memory_id], |row| row.get::<_, String>(0))
+            .context("failed to query memory tags")?;
+        let mut tags = Vec::new();
+        for row in rows {
+            tags.push(row.context("failed to read memory tag")?);
+        }
+        Ok(tags)
+    }
+
+    /// Find memories by exact (case-insensitive) tag.
+    pub fn search_memories_by_tag(&self, tag: &str, limit: usize) -> Result<Vec<Memory>> {
+        let conn = self.conn.lock().expect("lock poisoned");
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.id, m.project_id, m.content, m.memory_type,
+                        m.source_session_id, m.confidence, m.access_count,
+                        m.created_at, m.updated_at, m.valid_until
+                 FROM memories m
+                 JOIN memory_tags t ON t.memory_id = m.id
+                 WHERE lower(t.tag) = lower(?)
+                 ORDER BY m.created_at DESC NULLS LAST
+                 LIMIT ?",
+            )
+            .context("failed to prepare tag search")?;
+        let rows = stmt
+            .query_map(params![tag, limit as i64], |row| {
+                Ok(Memory {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    content: row.get(2)?,
+                    memory_type: row.get(3)?,
+                    source_session_id: row.get(4)?,
+                    confidence: row.get::<_, f32>(5).unwrap_or(1.0),
+                    access_count: row.get::<_, i32>(6).unwrap_or(0),
+                    created_at: row.get(7)?,
+                    updated_at: row.get(8)?,
+                    valid_until: row.get(9)?,
+                })
+            })
+            .context("failed to query memories by tag")?;
+        let mut memories = Vec::new();
+        for row in rows {
+            memories.push(row.context("failed to read tagged memory")?);
+        }
+        Ok(memories)
     }
 
     /// Get per-agent session counts.
@@ -2281,6 +2863,30 @@ impl DuckStore {
         }
     }
 
+    /// List all graph nodes in stable ID order.
+    pub fn list_graph_nodes(&self) -> Result<Vec<GraphNodeRow>> {
+        let conn = self.conn.lock().expect("lock poisoned");
+        let mut stmt = conn
+            .prepare("SELECT id, kind, name, properties FROM graph_nodes ORDER BY id")
+            .context("failed to prepare graph node list")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(GraphNodeRow {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    name: row.get(2)?,
+                    properties: row.get::<_, String>(3).unwrap_or_else(|_| "{}".to_string()),
+                })
+            })
+            .context("failed to query graph nodes")?;
+
+        let mut nodes = Vec::new();
+        for row in rows {
+            nodes.push(row.context("failed to read graph node row")?);
+        }
+        Ok(nodes)
+    }
+
     /// Delete a graph node and all its incident edges. Returns `true` if the
     /// node existed.
     pub fn delete_graph_node(&self, id: &str) -> Result<bool> {
@@ -2393,22 +2999,35 @@ impl DuckStore {
     }
 
     // -----------------------------------------------------------------------
-    // Graph PGQ queries (require DuckPGQ extension)
+    // Graph algorithms (persisted SQL tables; DuckPGQ is optional)
     // -----------------------------------------------------------------------
 
+    fn load_graph_edges(&self) -> Result<Vec<(String, String, String)>> {
+        let conn = self.conn.lock().expect("lock poisoned");
+        let mut stmt = conn
+            .prepare("SELECT from_id, to_id, kind FROM graph_edges")
+            .context("failed to prepare graph edge load")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .context("failed to load graph edges")?;
+
+        let mut edges = Vec::new();
+        for row in rows {
+            edges.push(row.context("failed to read graph edge")?);
+        }
+        Ok(edges)
+    }
+
     /// Find the shortest path between two nodes (up to `max_depth` hops).
-    /// Returns the sequence of node IDs along the path, or an empty vec if no
-    /// path exists. Requires the DuckPGQ extension to be loaded via
-    /// `init_graph()`.
-    ///
-    /// DuckPGQ SQL/PGQ syntax (intended):
-    /// ```sql
-    /// SELECT path_nodes
-    /// FROM GRAPH_TABLE(remembrant_graph
-    ///     MATCH p = ANY SHORTEST (a:node WHERE a.id = ?)-[e:edge]->{1,N}(b:node WHERE b.id = ?)
-    ///     COLUMNS (path_nodes(p))
-    /// )
-    /// ```
+    /// Returns the sequence of node IDs along the path, or an empty vector if
+    /// no path exists. The implementation uses the persisted graph tables and
+    /// does not require the optional DuckPGQ extension.
     pub fn pgq_shortest_path(
         &self,
         from_id: &str,
@@ -2419,81 +3038,133 @@ impl DuckStore {
             return Ok(vec![from_id.to_string()]);
         }
 
-        let conn = self.conn.lock().expect("lock poisoned");
-
-        // DuckPGQ shortest path query.
-        // The exact syntax may vary across DuckPGQ versions; if this fails the
-        // caller gets a descriptive error.
-        let sql = format!(
-            "FROM GRAPH_TABLE(remembrant_graph
-                 MATCH p = ANY SHORTEST (a:graph_nodes WHERE a.id = ?)-[e:graph_edges]->{{1,{max_depth}}}(b:graph_nodes WHERE b.id = ?)
-                 COLUMNS (vertices(p) AS path_vertices)
-             )"
-        );
-
-        let result = conn.query_row(&sql, params![from_id, to_id], |row| {
-            // DuckPGQ returns path vertices as a LIST; extract as a string
-            // representation and parse, or read directly if the driver supports
-            // list types.
-            let raw: String = row.get(0)?;
-            Ok(raw)
-        });
-
-        match result {
-            Ok(raw) => {
-                // Parse the returned list representation.  DuckPGQ returns
-                // something like `[{id: a, ...}, {id: b, ...}]` — extract IDs.
-                let ids: Vec<String> = raw
-                    .split("id: ")
-                    .skip(1)
-                    .filter_map(|s| s.split([',', '}'].as_ref()).next())
-                    .map(|s| s.trim().to_string())
-                    .collect();
-                Ok(ids)
-            }
-            Err(duckdb::Error::QueryReturnedNoRows) => Ok(Vec::new()),
-            Err(e) => Err(anyhow::Error::new(e)
-                .context("DuckPGQ shortest_path query failed — ensure init_graph() was called")),
+        let edges = self.load_graph_edges()?;
+        let mut adjacency: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (from, to, _) in edges {
+            adjacency.entry(from).or_default().push(to);
         }
+
+        let mut parents: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let mut depths: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        depths.insert(from_id.to_string(), 0);
+        let mut frontier = vec![from_id.to_string()];
+
+        while let Some(current) = frontier.first().cloned() {
+            frontier.remove(0);
+            let Some(next_depth) = depths
+                .get(&current)
+                .map(|depth| depth + 1)
+                .filter(|depth| *depth <= max_depth)
+            else {
+                continue;
+            };
+
+            for neighbor in adjacency.get(&current).cloned().unwrap_or_default() {
+                if parents.contains_key(&neighbor) || neighbor == from_id {
+                    continue;
+                }
+                parents.insert(neighbor.clone(), current.clone());
+                depths.insert(neighbor.clone(), next_depth);
+                if neighbor == to_id {
+                    let mut path = vec![to_id.to_string()];
+                    while let Some(parent) = parents.get(path.last().expect("path exists")) {
+                        path.push(parent.clone());
+                        if parent == from_id {
+                            path.reverse();
+                            return Ok(path);
+                        }
+                    }
+                }
+                frontier.push(neighbor);
+            }
+        }
+
+        Ok(Vec::new())
     }
 
     /// Run PageRank on the graph and return the top `limit` nodes with scores.
-    /// Requires the DuckPGQ extension to be loaded via `init_graph()`.
-    ///
-    /// DuckPGQ syntax (intended):
-    /// ```sql
-    /// SELECT node_id, pagerank_score
-    /// FROM pagerank(remembrant_graph, graph_nodes, graph_edges)
-    /// ORDER BY pagerank_score DESC LIMIT ?
-    /// ```
+    /// This deterministic implementation works directly on the persisted graph
+    /// tables and does not require the optional DuckPGQ extension.
     pub fn pgq_pagerank(&self, limit: usize) -> Result<Vec<(String, f64)>> {
-        let conn = self.conn.lock().expect("lock poisoned");
+        let edges = self.load_graph_edges()?;
+        let mut nodes: Vec<String> = Vec::new();
+        let mut node_set = std::collections::HashSet::new();
+        let mut outgoing: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
 
-        let mut stmt = conn
-            .prepare(
-                "SELECT node_id, pagerank_score
-                 FROM pagerank(remembrant_graph, graph_nodes, graph_edges)
-                 ORDER BY pagerank_score DESC
-                 LIMIT ?",
-            )
-            .context("DuckPGQ pagerank query failed — ensure init_graph() was called")?;
-
-        let rows = stmt
-            .query_map(params![limit as i64], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
-            })
-            .context("failed to execute pagerank query")?;
-
-        let mut results = Vec::new();
-        for row in rows {
-            results.push(row.context("failed to read pagerank row")?);
+        for (from, to, _) in edges {
+            if node_set.insert(from.clone()) {
+                nodes.push(from.clone());
+            }
+            if node_set.insert(to.clone()) {
+                nodes.push(to.clone());
+            }
+            outgoing.entry(from).or_default().push(to);
         }
-        Ok(results)
+        if nodes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let node_count = nodes.len() as f64;
+        let damping = 0.85;
+        let mut scores: std::collections::HashMap<String, f64> = nodes
+            .iter()
+            .map(|node| (node.clone(), 1.0 / node_count))
+            .collect();
+        let mut incoming: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        for (from, targets) in &outgoing {
+            for target in targets {
+                incoming
+                    .entry(target.clone())
+                    .or_default()
+                    .push(from.clone());
+            }
+        }
+
+        for _ in 0..20 {
+            let mut next = std::collections::HashMap::new();
+            let dangling_sum: f64 = nodes
+                .iter()
+                .filter(|node| outgoing.get(*node).is_none_or(Vec::is_empty))
+                .map(|node| scores[node])
+                .sum();
+
+            for node in &nodes {
+                let contribution: f64 = incoming
+                    .get(node)
+                    .into_iter()
+                    .flatten()
+                    .map(|source| scores[source] / outgoing[source].len() as f64)
+                    .sum();
+                let score = (1.0 - damping) / node_count
+                    + damping * (contribution + dangling_sum / node_count);
+                next.insert(node.clone(), score);
+            }
+            scores = next;
+        }
+
+        nodes.sort_by(|a, b| {
+            scores[b]
+                .partial_cmp(&scores[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.cmp(b))
+        });
+        Ok(nodes
+            .into_iter()
+            .take(limit)
+            .map(|node| {
+                let score = scores[&node];
+                (node, score)
+            })
+            .collect())
     }
 
     /// Pattern match: find all nodes connected to `node_id` via a specific
     /// edge kind in the given direction ("outgoing" or "incoming").
-    /// Requires the DuckPGQ extension to be loaded via `init_graph()`.
+    /// Uses standard SQL so graph exploration remains available in all builds.
     pub fn pgq_pattern_match(
         &self,
         node_id: &str,
@@ -2502,22 +3173,23 @@ impl DuckStore {
     ) -> Result<Vec<GraphNodeRow>> {
         let conn = self.conn.lock().expect("lock poisoned");
 
-        // Use SQL/PGQ MATCH with a WHERE filter on edge kind.
         let sql = if direction == "outgoing" {
-            "FROM GRAPH_TABLE(remembrant_graph
-                 MATCH (a:graph_nodes WHERE a.id = ?)-[e:graph_edges WHERE e.kind = ?]->(b:graph_nodes)
-                 COLUMNS (b.id, b.kind, b.name, b.properties)
-             )"
+            "SELECT n.id, n.kind, n.name, n.properties
+             FROM graph_edges e
+             JOIN graph_nodes n ON n.id = e.to_id
+             WHERE e.from_id = ? AND e.kind = ?
+             ORDER BY n.id"
         } else {
-            "FROM GRAPH_TABLE(remembrant_graph
-                 MATCH (a:graph_nodes)<-[e:graph_edges WHERE e.kind = ?]-(b:graph_nodes WHERE b.id = ?)
-                 COLUMNS (a.id, a.kind, a.name, a.properties)
-             )"
+            "SELECT n.id, n.kind, n.name, n.properties
+             FROM graph_edges e
+             JOIN graph_nodes n ON n.id = e.from_id
+             WHERE e.to_id = ? AND e.kind = ?
+             ORDER BY n.id"
         };
 
         let mut stmt = conn
             .prepare(sql)
-            .context("DuckPGQ pattern_match query failed — ensure init_graph() was called")?;
+            .context("failed to prepare graph pattern match")?;
 
         let map_row = |row: &duckdb::Row| -> duckdb::Result<GraphNodeRow> {
             Ok(GraphNodeRow {
@@ -2530,10 +3202,10 @@ impl DuckStore {
 
         let rows = if direction == "outgoing" {
             stmt.query_map(params![node_id, edge_kind], map_row)
-                .context("failed to execute pattern match")?
+                .context("failed to execute graph pattern match")?
         } else {
-            stmt.query_map(params![edge_kind, node_id], map_row)
-                .context("failed to execute pattern match")?
+            stmt.query_map(params![node_id, edge_kind], map_row)
+                .context("failed to execute graph pattern match")?
         };
 
         let mut results = Vec::new();
@@ -2759,6 +3431,390 @@ impl DuckStore {
         }
         Ok(stats)
     }
+
+    // -----------------------------------------------------------------------
+    // Briefing / daily-digest helpers
+    // -----------------------------------------------------------------------
+
+    /// Per-project breakdown for the current UTC day.
+    pub fn get_project_breakdown_today(&self) -> Result<Vec<serde_json::Value>> {
+        let now = Utc::now().naive_utc();
+        let since = now.date().and_hms_opt(0, 0, 0).context("invalid date")?;
+        let sessions = self.search_sessions(None, None, Some(since), 10_000)?;
+
+        let mut by_project: std::collections::HashMap<
+            String,
+            (usize, i64, Vec<String>, std::collections::HashSet<String>),
+        > = std::collections::HashMap::new();
+
+        for s in &sessions {
+            let project = s
+                .project_id
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string());
+            let entry = by_project
+                .entry(project)
+                .or_insert_with(|| (0, 0, Vec::new(), std::collections::HashSet::new()));
+            entry.0 += 1;
+            entry.1 += s.total_tokens.unwrap_or(0) as i64;
+            for f in &s.files_changed {
+                if !entry.2.contains(f) {
+                    entry.2.push(f.clone());
+                }
+            }
+            entry.3.insert(s.agent.clone());
+        }
+
+        let mut result: Vec<serde_json::Value> = by_project
+            .into_iter()
+            .map(|(project, (sessions, tokens, files, agents))| {
+                serde_json::json!({
+                    "project": project,
+                    "sessions": sessions,
+                    "tokens": tokens,
+                    "files_changed": files,
+                    "agents": agents.into_iter().collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        result.sort_by(|a, b| {
+            b["sessions"]
+                .as_u64()
+                .unwrap_or(0)
+                .cmp(&a["sessions"].as_u64().unwrap_or(0))
+        });
+        Ok(result)
+    }
+
+    /// Decisions created during the current UTC day.
+    pub fn get_decisions_today(&self) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().expect("lock poisoned");
+        let now = Utc::now().naive_utc();
+        let since = now.date().and_hms_opt(0, 0, 0).context("invalid date")?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT what, why, created_at
+                 FROM decisions
+                 WHERE created_at >= ?
+                 ORDER BY created_at DESC",
+            )
+            .context("failed to prepare get_decisions_today")?;
+
+        let rows = stmt
+            .query_map(params![since], |row| {
+                let what: String = row.get(0)?;
+                let why: Option<String> = row.get(1)?;
+                let created_at: Option<NaiveDateTime> = row.get(2)?;
+                Ok(serde_json::json!({
+                    "what": what,
+                    "why": why,
+                    "created_at": created_at.map(|t| t.to_string()),
+                }))
+            })
+            .context("failed to query decisions today")?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.context("failed to read decisions_today row")?);
+        }
+        Ok(result)
+    }
+
+    /// Facts created or becoming valid during the current UTC day.
+    pub fn get_new_facts_today(&self) -> Result<Vec<serde_json::Value>> {
+        let conn = self.conn.lock().expect("lock poisoned");
+        let now = Utc::now().naive_utc();
+        let since = now.date().and_hms_opt(0, 0, 0).context("invalid date")?;
+
+        let mut stmt = conn
+            .prepare(
+                "SELECT subject, predicate, object, confidence
+                 FROM facts
+                 WHERE created_at >= ? OR valid_at >= ?
+                 ORDER BY created_at DESC NULLS LAST",
+            )
+            .context("failed to prepare get_new_facts_today")?;
+
+        let rows = stmt
+            .query_map(params![since, since], |row| {
+                let subject: String = row.get(0)?;
+                let predicate: String = row.get(1)?;
+                let object: String = row.get(2)?;
+                let confidence: f32 = row.get::<_, f32>(3).unwrap_or(0.0);
+                Ok(serde_json::json!({
+                    "subject": subject,
+                    "predicate": predicate,
+                    "object": object,
+                    "confidence": confidence,
+                }))
+            })
+            .context("failed to query new facts today")?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row.context("failed to read new_facts_today row")?);
+        }
+        Ok(result)
+    }
+
+    /// Top files changed today, aggregated from session `files_changed` arrays.
+    pub fn get_top_files_today(&self, limit: usize) -> Result<Vec<(String, i64)>> {
+        let now = Utc::now().naive_utc();
+        let since = now.date().and_hms_opt(0, 0, 0).context("invalid date")?;
+        let sessions = self.search_sessions(None, None, Some(since), 10_000)?;
+
+        let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for s in &sessions {
+            for f in &s.files_changed {
+                *counts.entry(f.clone()).or_insert(0) += 1;
+            }
+        }
+
+        let mut pairs: Vec<(String, i64)> = counts.into_iter().collect();
+        pairs.sort_by(|a, b| b.1.cmp(&a.1));
+        pairs.truncate(limit);
+        Ok(pairs)
+    }
+
+    /// Session summaries from the last 24 hours.
+    pub fn get_session_summaries_today(&self) -> Result<Vec<serde_json::Value>> {
+        let now = Utc::now().naive_utc();
+        let since = now.date().and_hms_opt(0, 0, 0).context("invalid date")?;
+        let sessions = self.search_sessions(None, None, Some(since), 10_000)?;
+
+        let result: Vec<serde_json::Value> = sessions
+            .into_iter()
+            .filter(|s| s.summary.is_some())
+            .map(|s| {
+                serde_json::json!({
+                    "agent": s.agent,
+                    "project": s.project_id,
+                    "summary": s.summary,
+                    "started_at": s.started_at.map(|t| t.to_string()),
+                })
+            })
+            .collect();
+        Ok(result)
+    }
+
+    /// Return items that need human attention: stale memories, contradictory
+    /// facts, high-churn files, and cross-agent conflicts.
+    pub fn get_attention_items(&self) -> Result<Vec<serde_json::Value>> {
+        let now = Utc::now().naive_utc();
+        let stale_cutoff = now - chrono::Duration::days(30);
+        let churn_cutoff = now - chrono::Duration::days(7);
+        let conflict_cutoff = now - chrono::Duration::days(7);
+        let conn = self.conn.lock().expect("lock poisoned");
+        let mut items: Vec<serde_json::Value> = Vec::new();
+
+        // 1. Stale memories — older than 30 days
+        {
+            let mut stmt = conn.prepare(
+                "SELECT id, project_id, content, memory_type, created_at
+                 FROM memories
+                 WHERE created_at < ?
+                 ORDER BY created_at ASC
+                 LIMIT 10",
+            )?;
+            let rows = stmt.query_map(params![stale_cutoff], |row| {
+                let id: String = row.get(0)?;
+                let project_id: Option<String> = row.get(1)?;
+                let content: String = row.get(2)?;
+                let memory_type: Option<String> = row.get(3)?;
+                let created_at: Option<NaiveDateTime> = row.get(4)?;
+                Ok((id, project_id, content, memory_type, created_at))
+            })?;
+            for row in rows {
+                let (id, project_id, content, memory_type, created_at) = row?;
+                let snippet: String = content.chars().take(120).collect();
+                let title = format!(
+                    "Stale {} memory in {}",
+                    memory_type.as_deref().unwrap_or("unknown"),
+                    project_id.as_deref().unwrap_or("unknown project"),
+                );
+                let ts = created_at
+                    .map(|t| t.and_utc().to_rfc3339())
+                    .unwrap_or_default();
+                items.push(serde_json::json!({
+                    "type": "stale_memory",
+                    "severity": "low",
+                    "title": title,
+                    "detail": format!("Created {ts}, not updated in 30+ days: {snippet}..."),
+                    "entity_ids": [id],
+                    "created_at": ts,
+                }));
+            }
+        }
+
+        // 2. Contradictory facts — same subject+predicate, different object, both active
+        {
+            let mut stmt = conn.prepare(
+                "SELECT f1.id, f2.id, f1.subject, f1.predicate, f1.object, f2.object,
+                        f1.source_agent, f2.source_agent, f1.created_at
+                 FROM facts f1
+                 JOIN facts f2
+                   ON f1.subject = f2.subject
+                  AND f1.predicate = f2.predicate
+                  AND f1.id < f2.id
+                  AND f1.object <> f2.object
+                 WHERE f1.invalid_at IS NULL
+                   AND f2.invalid_at IS NULL
+                 LIMIT 10",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                let id1: String = row.get(0)?;
+                let id2: String = row.get(1)?;
+                let subject: String = row.get(2)?;
+                let predicate: String = row.get(3)?;
+                let obj1: String = row.get(4)?;
+                let obj2: String = row.get(5)?;
+                let agent1: Option<String> = row.get(6)?;
+                let agent2: Option<String> = row.get(7)?;
+                let created_at: Option<NaiveDateTime> = row.get(8)?;
+                Ok((
+                    id1, id2, subject, predicate, obj1, obj2, agent1, agent2, created_at,
+                ))
+            })?;
+            for row in rows {
+                let (id1, id2, subject, predicate, obj1, obj2, agent1, agent2, created_at) = row?;
+                let a1 = agent1.as_deref().unwrap_or("unknown");
+                let a2 = agent2.as_deref().unwrap_or("unknown");
+                let ts = created_at
+                    .map(|t| t.and_utc().to_rfc3339())
+                    .unwrap_or_default();
+                items.push(serde_json::json!({
+                    "type": "contradictory_fact",
+                    "severity": "high",
+                    "title": format!("Contradictory facts for \"{subject}\""),
+                    "detail": format!("{subject} {predicate} \"{obj1}\" ({a1}) vs \"{obj2}\" ({a2})"),
+                    "entity_ids": [id1, id2],
+                    "created_at": ts,
+                }));
+            }
+        }
+
+        // 3. High-churn files — >5 sessions in last 7 days
+        {
+            let result: Result<(), anyhow::Error> = (|| {
+                let mut stmt = conn.prepare(
+                    "SELECT f.file, COUNT(*) AS freq
+                     FROM sessions s,
+                          LATERAL (
+                              SELECT UNNEST(
+                              json_extract_string(s.files_changed, '$[*]')
+                              ) AS file
+                          ) f
+                     WHERE s.started_at >= ?
+                       AND s.files_changed IS NOT NULL
+                       AND s.files_changed <> '[]'
+                       AND s.files_changed <> ''
+                     GROUP BY f.file
+                     HAVING COUNT(*) > 5
+                     ORDER BY freq DESC
+                     LIMIT 10",
+                )?;
+                let rows = stmt.query_map(params![churn_cutoff], |row| {
+                    let file_path: String = row.get(0)?;
+                    let freq: i64 = row.get(1)?;
+                    Ok((file_path, freq))
+                })?;
+                for row in rows {
+                    let (file_path, freq) = row?;
+                    items.push(serde_json::json!({
+                        "type": "high_churn",
+                        "severity": "medium",
+                        "title": format!("High-churn file: {file_path}"),
+                        "detail": format!("{file_path} changed in {freq} sessions in the last 7 days"),
+                        "entity_ids": [file_path],
+                        "created_at": Utc::now().to_rfc3339(),
+                    }));
+                }
+                Ok(())
+            })();
+            if let Err(e) = result {
+                warn!("high-churn query failed: {e}");
+            }
+        }
+
+        // 4. Cross-agent conflicts — different agents, same project+type, different content
+        {
+            let result: Result<(), anyhow::Error> = (|| {
+                let mut stmt = conn.prepare(
+                    "SELECT m1.id, m2.id, m1.project_id, m1.memory_type,
+                            s1.agent, s2.agent, m1.content, m2.content, m1.created_at
+                     FROM memories m1
+                     JOIN memories m2
+                       ON m1.project_id = m2.project_id
+                      AND m1.memory_type = m2.memory_type
+                      AND m1.id < m2.id
+                      AND m1.content <> m2.content
+                     JOIN sessions s1 ON m1.source_session_id = s1.id
+                     JOIN sessions s2 ON m2.source_session_id = s2.id
+                     WHERE s1.agent <> s2.agent
+                       AND m1.created_at >= ?
+                       AND m2.created_at >= ?
+                     LIMIT 10",
+                )?;
+                let rows = stmt.query_map(params![conflict_cutoff, conflict_cutoff], |row| {
+                    let id1: String = row.get(0)?;
+                    let id2: String = row.get(1)?;
+                    let project_id: Option<String> = row.get(2)?;
+                    let memory_type: Option<String> = row.get(3)?;
+                    let agent1: String = row.get(4)?;
+                    let agent2: String = row.get(5)?;
+                    let content1: String = row.get(6)?;
+                    let content2: String = row.get(7)?;
+                    let created_at: Option<NaiveDateTime> = row.get(8)?;
+                    Ok((
+                        id1,
+                        id2,
+                        project_id,
+                        memory_type,
+                        agent1,
+                        agent2,
+                        content1,
+                        content2,
+                        created_at,
+                    ))
+                })?;
+                for row in rows {
+                    let (
+                        id1,
+                        id2,
+                        project_id,
+                        memory_type,
+                        agent1,
+                        agent2,
+                        content1,
+                        content2,
+                        created_at,
+                    ) = row?;
+                    let proj = project_id.as_deref().unwrap_or("unknown");
+                    let mtype = memory_type.as_deref().unwrap_or("unknown");
+                    let snip1: String = content1.chars().take(80).collect();
+                    let snip2: String = content2.chars().take(80).collect();
+                    let ts = created_at
+                        .map(|t| t.and_utc().to_rfc3339())
+                        .unwrap_or_default();
+                    items.push(serde_json::json!({
+                        "type": "conflict",
+                        "severity": "high",
+                        "title": format!("Cross-agent conflict in {proj} ({mtype})"),
+                        "detail": format!("{agent1}: \"{snip1}...\" vs {agent2}: \"{snip2}...\""),
+                        "entity_ids": [id1, id2],
+                        "created_at": ts,
+                    }));
+                }
+                Ok(())
+            })();
+            if let Err(e) = result {
+                warn!("cross-agent conflict query failed: {e}");
+            }
+        }
+
+        Ok(items)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2816,6 +3872,205 @@ mod tests {
         assert_eq!(recent.len(), 2);
         assert!(recent.iter().any(|s| s.id == "s-1"));
         assert!(recent.iter().any(|s| s.id == "s-2"));
+        assert_eq!(
+            store.get_session("s-1").unwrap().map(|s| s.id),
+            Some("s-1".into())
+        );
+        assert!(store.get_session("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_session_replacement_is_idempotent_for_derived_rows() {
+        let store = DuckStore::open_in_memory().unwrap();
+        let session = make_session("replace-session");
+        store.insert_or_replace_session(&session).unwrap();
+
+        store
+            .insert_tool_call(&ToolCall {
+                id: "old-tool".into(),
+                session_id: Some("replace-session".into()),
+                tool_name: Some("Read".into()),
+                command: None,
+                success: None,
+                error_message: None,
+                duration_ms: None,
+                timestamp: None,
+            })
+            .unwrap();
+        let mut derived = make_memory("old-memory", "old derived memory");
+        derived.source_session_id = Some("replace-session".into());
+        store.insert_memory(&derived).unwrap();
+        store
+            .set_memory_tags("old-memory", &["derived".into()])
+            .unwrap();
+        store
+            .insert_graph_node(
+                "session:replace-session",
+                "Session",
+                "replace-session",
+                "{}",
+            )
+            .unwrap();
+        store
+            .insert_graph_node("memory:old-memory", "Memory", "old memory", "{}")
+            .unwrap();
+        store
+            .insert_graph_edge(
+                "memory:old-memory",
+                "session:replace-session",
+                "DERIVED_FROM",
+                "{}",
+            )
+            .unwrap();
+
+        let mut replacement = make_session("replace-session");
+        replacement.summary = Some("updated summary".into());
+        store.insert_or_replace_session(&replacement).unwrap();
+        store
+            .insert_tool_call(&ToolCall {
+                id: "new-tool".into(),
+                session_id: Some("replace-session".into()),
+                tool_name: Some("Edit".into()),
+                command: None,
+                success: None,
+                error_message: None,
+                duration_ms: None,
+                timestamp: None,
+            })
+            .unwrap();
+
+        assert_eq!(store.count_sessions().unwrap(), 1);
+        assert_eq!(store.count_tool_calls().unwrap(), 1);
+        assert_eq!(store.count_memories().unwrap(), 0);
+        assert!(
+            store
+                .get_graph_node("session:replace-session")
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.get_graph_node("memory:old-memory").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_delete_session_cascades_all_derived_data() {
+        let store = DuckStore::open_in_memory().unwrap();
+        store
+            .insert_or_replace_session(&make_session("delete-session"))
+            .unwrap();
+        let mut memory = make_memory("delete-memory", "derived memory");
+        memory.source_session_id = Some("delete-session".into());
+        store.insert_memory(&memory).unwrap();
+        store
+            .insert_decision(&Decision {
+                id: "delete-decision".into(),
+                session_id: Some("delete-session".into()),
+                project_id: Some("proj-1".into()),
+                decision_type: None,
+                what: "delete me".into(),
+                why: None,
+                alternatives: Vec::new(),
+                outcome: None,
+                created_at: None,
+                valid_until: None,
+            })
+            .unwrap();
+        let mut fact = make_fact("delete-fact", "session", "produced", "fact");
+        fact.source_session_id = Some("delete-session".into());
+        store.insert_fact(&fact).unwrap();
+        store
+            .insert_graph_node("session:delete-session", "Session", "session", "{}")
+            .unwrap();
+
+        assert!(store.delete_session("delete-session").unwrap());
+        assert_eq!(store.count_sessions().unwrap(), 0);
+        assert_eq!(store.count_memories().unwrap(), 0);
+        assert_eq!(store.count_decisions().unwrap(), 0);
+        assert_eq!(store.count_tool_calls().unwrap(), 0);
+        assert_eq!(store.count_facts().unwrap(), 0);
+        assert!(
+            store
+                .get_graph_node("session:delete-session")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_gc_removes_old_session_graph_and_orphaned_tool_calls() {
+        let store = DuckStore::open_in_memory().unwrap();
+        let now = Utc::now().naive_utc();
+        let mut old = make_session("old-session");
+        old.started_at = Some(now - chrono::Duration::days(40));
+        let current = make_session("current-session");
+        store.insert_session(&old).unwrap();
+        store.insert_session(&current).unwrap();
+
+        store
+            .insert_graph_node("session:old-session", "Session", "old-session", "{}")
+            .unwrap();
+        store
+            .insert_graph_node(
+                "session:current-session",
+                "Session",
+                "current-session",
+                "{}",
+            )
+            .unwrap();
+        store
+            .insert_graph_edge(
+                "session:old-session",
+                "session:current-session",
+                "RELATES_TO",
+                "{}",
+            )
+            .unwrap();
+
+        store
+            .insert_tool_call(&ToolCall {
+                id: "orphan-tool".into(),
+                session_id: Some("missing-session".into()),
+                tool_name: Some("Read".into()),
+                command: None,
+                success: None,
+                error_message: None,
+                duration_ms: None,
+                timestamp: None,
+            })
+            .unwrap();
+        store
+            .insert_tool_call(&ToolCall {
+                id: "current-tool".into(),
+                session_id: Some("current-session".into()),
+                tool_name: Some("Edit".into()),
+                command: None,
+                success: None,
+                error_message: None,
+                duration_ms: None,
+                timestamp: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            store
+                .gc_sessions_before(now - chrono::Duration::days(30))
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.delete_orphaned_tool_calls().unwrap(), 1);
+        assert!(
+            store
+                .get_graph_node("session:old-session")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_graph_node("session:current-session")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(store.count_graph_edges().unwrap(), 0);
+        assert_eq!(store.count_tool_calls().unwrap(), 1);
     }
 
     #[test]
@@ -2867,6 +4122,178 @@ mod tests {
         }
         let limited = store.get_recent_sessions(3).unwrap();
         assert_eq!(limited.len(), 3);
+    }
+
+    #[test]
+    fn test_daily_and_today_analytics_use_utc_day_boundaries() {
+        let store = DuckStore::open_in_memory().unwrap();
+        let now = Utc::now().naive_utc();
+        let today_start = now.date().and_hms_opt(0, 0, 0).unwrap();
+
+        let mut current = make_session("analytics-today");
+        current.started_at = Some(now);
+        current.files_changed = vec!["src/today.rs".into()];
+
+        let mut previous = make_session("analytics-previous");
+        previous.started_at = Some(today_start - chrono::Duration::hours(1));
+        previous.files_changed = vec!["src/yesterday.rs".into()];
+
+        store.insert_session(&current).unwrap();
+        store.insert_session(&previous).unwrap();
+        store
+            .insert_memory(&make_memory("analytics-memory", "today memory"))
+            .unwrap();
+        store
+            .insert_decision(&Decision {
+                id: "analytics-decision".into(),
+                session_id: Some("analytics-today".into()),
+                project_id: Some("proj-1".into()),
+                decision_type: Some("architecture".into()),
+                what: "use UTC boundaries".into(),
+                why: None,
+                alternatives: Vec::new(),
+                outcome: None,
+                created_at: Some(now),
+                valid_until: None,
+            })
+            .unwrap();
+
+        assert_eq!(store.count_sessions_since(today_start).unwrap(), 1);
+        let todays_sessions = store.get_todays_sessions().unwrap();
+        assert_eq!(todays_sessions.len(), 1);
+        assert_eq!(todays_sessions[0].id, "analytics-today");
+        assert_eq!(
+            store
+                .get_daily_session_counts(0)
+                .unwrap()
+                .last()
+                .copied()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_daily_memory_counts(0)
+                .unwrap()
+                .last()
+                .copied()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .get_daily_decision_counts(0)
+                .unwrap()
+                .last()
+                .copied()
+                .unwrap(),
+            1
+        );
+
+        let daily = store.get_daily_counts(0).unwrap();
+        assert_eq!(daily.len(), 1);
+        assert_eq!(daily[0].0, now.date().to_string());
+        assert_eq!(daily[0].1, 1);
+
+        let projects = store.get_project_breakdown_today().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0]["sessions"].as_u64(), Some(1));
+        assert_eq!(
+            projects[0]["files_changed"][0].as_str(),
+            Some("src/today.rs")
+        );
+
+        let top_files = store.get_top_files_today(10).unwrap();
+        assert_eq!(top_files, vec![("src/today.rs".into(), 1)]);
+
+        let decisions = store.get_decisions_today().unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0]["what"].as_str(), Some("use UTC boundaries"));
+
+        let summaries = store.get_session_summaries_today().unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0]["summary"].as_str(), Some("refactored module"));
+    }
+
+    #[test]
+    fn test_manual_notes_support_tags() {
+        let store = DuckStore::open_in_memory().unwrap();
+        let id = store
+            .insert_note_with_tags(
+                "Prefer small composable parsers",
+                Some("proj-1"),
+                &[" rust ".into(), "RUST".into(), "architecture".into()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.get_memory_tags(&id).unwrap(),
+            vec!["architecture".to_string(), "rust".to_string()]
+        );
+
+        let tagged = store.search_memories_by_tag("RUST", 10).unwrap();
+        assert_eq!(tagged.len(), 1);
+        assert_eq!(tagged[0].id, id);
+        assert_eq!(tagged[0].memory_type.as_deref(), Some("note"));
+        assert_eq!(tagged[0].content, "Prefer small composable parsers");
+        assert_eq!(tagged[0].project_id.as_deref(), Some("proj-1"));
+
+        let empty = store
+            .insert_note_with_tags("   ", Some("  "), &[])
+            .unwrap_err();
+        assert!(empty.to_string().contains("cannot be empty"));
+        assert_eq!(store.get_project_ids().unwrap(), vec!["proj-1".to_string()]);
+        store
+            .insert_graph_node(&format!("memory:{id}"), "Memory", "note", "{}")
+            .unwrap();
+        store
+            .insert_graph_node("project:proj-1", "Project", "proj-1", "{}")
+            .unwrap();
+        store
+            .insert_graph_edge(&format!("memory:{id}"), "project:proj-1", "ABOUT", "{}")
+            .unwrap();
+
+        assert!(store.delete_memory(&id).unwrap());
+        assert!(store.get_memory_tags(&id).unwrap().is_empty());
+        assert!(store.search_memories_by_tag("rust", 10).unwrap().is_empty());
+        assert!(
+            store
+                .get_graph_node(&format!("memory:{id}"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_attention_items_include_conflicts_and_high_churn() {
+        let store = DuckStore::open_in_memory().unwrap();
+
+        for i in 0..6 {
+            let mut session = make_session(&format!("churn-{i}"));
+            session.files_changed = vec!["src/hot.rs".into()];
+            store.insert_session(&session).unwrap();
+        }
+
+        store
+            .insert_fact(&make_fact("attention-jwt", "auth", "uses", "JWT"))
+            .unwrap();
+        store
+            .insert_fact(&make_fact("attention-oauth", "auth", "uses", "OAuth2"))
+            .unwrap();
+
+        let items = store.get_attention_items().unwrap();
+        let types: Vec<_> = items
+            .iter()
+            .filter_map(|item| item["type"].as_str())
+            .collect();
+
+        assert!(types.contains(&"high_churn"), "items: {items:?}");
+        assert!(types.contains(&"contradictory_fact"), "items: {items:?}");
+        let churn = items
+            .iter()
+            .find(|item| item["type"] == "high_churn")
+            .unwrap();
+        assert_eq!(churn["entity_ids"][0].as_str(), Some("src/hot.rs"));
     }
 
     // -------------------------------------------------------------------
@@ -3035,6 +4462,53 @@ mod tests {
 
         assert_eq!(store.count_graph_nodes().unwrap(), 0);
         assert_eq!(store.count_graph_edges().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_graph_algorithms_work_without_optional_duckpgq_extension() {
+        let store = DuckStore::open_in_memory().unwrap();
+        store.insert_graph_node("a", "Concept", "a", "{}").unwrap();
+        store.insert_graph_node("b", "Concept", "b", "{}").unwrap();
+        store.insert_graph_node("c", "Concept", "c", "{}").unwrap();
+        store
+            .insert_graph_edge("a", "b", "RELATES_TO", "{}")
+            .unwrap();
+        store
+            .insert_graph_edge("b", "c", "RELATES_TO", "{}")
+            .unwrap();
+
+        assert_eq!(
+            store.pgq_shortest_path("a", "c", 3).unwrap(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert!(store.pgq_shortest_path("c", "a", 3).unwrap().is_empty());
+        assert_eq!(store.pgq_shortest_path("a", "a", 0).unwrap(), vec!["a"]);
+
+        let pagerank = store.pgq_pagerank(3).unwrap();
+        assert_eq!(pagerank.len(), 3);
+        assert!(pagerank[0].0 == *"c" || pagerank[0].0 == *"b");
+        assert!(pagerank.iter().all(|(_, score)| score.is_finite()));
+
+        let outgoing = store
+            .pgq_pattern_match("a", "RELATES_TO", "outgoing")
+            .unwrap();
+        assert_eq!(
+            outgoing
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            ["b"]
+        );
+        let incoming = store
+            .pgq_pattern_match("c", "RELATES_TO", "incoming")
+            .unwrap();
+        assert_eq!(
+            incoming
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<Vec<_>>(),
+            ["b"]
+        );
     }
 
     // -------------------------------------------------------------------

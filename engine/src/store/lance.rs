@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use arrow_array::types::Float32Type;
-use arrow_array::{Array, FixedSizeListArray, Float32Array, RecordBatch, StringArray, UInt32Array};
+use arrow_array::{
+    Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
+    UInt32Array,
+};
 use arrow_schema::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lancedb::database::CreateTableMode;
@@ -232,13 +235,75 @@ impl LanceStore {
             .await
             .context("failed to open code_embeddings table")?;
 
-        table
-            .add(vec![batch])
-            .execute()
+        let mut upsert = table.merge_insert(&["id"]);
+        upsert
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        upsert
+            .execute(Box::new(RecordBatchIterator::new(
+                vec![Ok(batch)],
+                schema.clone(),
+            )))
             .await
-            .context("failed to insert code embedding")?;
+            .context("failed to upsert code embedding")?;
 
         Ok(())
+    }
+
+    /// Delete all code embeddings for a project.
+    ///
+    /// Used by `rem embed --update` to replace stale chunks while preserving
+    /// embeddings belonging to other projects.
+    pub async fn delete_code_embeddings_for_project(&self, project_id: &str) -> Result<()> {
+        let table = self
+            .conn
+            .open_table("code_embeddings")
+            .execute()
+            .await
+            .context("failed to open code_embeddings for delete")?;
+        let escaped_project = project_id.replace('\'', "''");
+        table
+            .delete(&format!("project_id = '{escaped_project}'"))
+            .await
+            .context("failed to delete project code embeddings")?;
+        Ok(())
+    }
+
+    /// Return all code embedding IDs belonging to a project.
+    pub async fn get_code_embedding_ids_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<String>> {
+        let table = self
+            .conn
+            .open_table("code_embeddings")
+            .execute()
+            .await
+            .context("failed to open code_embeddings for ID lookup")?;
+        let escaped_project = project_id.replace('\'', "''");
+        let batches = table
+            .query()
+            .only_if(format!("project_id = '{escaped_project}'"))
+            .execute()
+            .await
+            .context("failed to query project code embedding IDs")?
+            .try_collect::<Vec<_>>()
+            .await
+            .context("failed to collect project code embedding IDs")?;
+
+        let mut ids = Vec::new();
+        for batch in &batches {
+            let Some(id_array) = batch
+                .column_by_name("id")
+                .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            else {
+                continue;
+            };
+            ids.extend(id_array.iter().flatten().map(str::to_string));
+        }
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
     }
 
     /// Insert a single memory embedding record.
@@ -279,11 +344,17 @@ impl LanceStore {
             .await
             .context("failed to open memory_embeddings table")?;
 
-        table
-            .add(vec![batch])
-            .execute()
+        let mut upsert = table.merge_insert(&["id"]);
+        upsert
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        upsert
+            .execute(Box::new(RecordBatchIterator::new(
+                vec![Ok(batch)],
+                schema.clone(),
+            )))
             .await
-            .context("failed to insert memory embedding")?;
+            .context("failed to upsert memory embedding")?;
 
         Ok(())
     }
@@ -660,5 +731,124 @@ impl LanceStore {
         }
 
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn embedding_inserts_are_idempotent_by_id() {
+        let directory = tempfile::tempdir().expect("temporary LanceDB directory");
+        let store = LanceStore::open_with_dim(directory.path(), 4)
+            .await
+            .expect("open LanceDB");
+
+        store
+            .insert_code_embedding(
+                "stable-code",
+                &[1.0, 0.0, 0.0, 0.0],
+                "old code",
+                "function",
+                "project",
+                Some("src/a.rs"),
+                Some("rust"),
+            )
+            .await
+            .expect("first code insert");
+        store
+            .insert_code_embedding(
+                "stable-code",
+                &[1.0, 0.0, 0.0, 0.0],
+                "new code",
+                "function",
+                "project",
+                Some("src/a.rs"),
+                Some("rust"),
+            )
+            .await
+            .expect("code upsert");
+
+        let code = store
+            .search_code(&[1.0, 0.0, 0.0, 0.0], 10)
+            .await
+            .expect("search code");
+        assert_eq!(code.len(), 1);
+        assert_eq!(code[0].content, "new code");
+
+        store
+            .insert_memory_embedding(
+                "stable-memory",
+                &[0.0, 1.0, 0.0, 0.0],
+                "old memory",
+                "note",
+                "project",
+            )
+            .await
+            .expect("first memory insert");
+        store
+            .insert_memory_embedding(
+                "stable-memory",
+                &[0.0, 1.0, 0.0, 0.0],
+                "new memory",
+                "note",
+                "project",
+            )
+            .await
+            .expect("memory upsert");
+
+        let memories = store
+            .search_memories(&[0.0, 1.0, 0.0, 0.0], 10)
+            .await
+            .expect("search memories");
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].content, "new memory");
+    }
+
+    #[tokio::test]
+    async fn delete_code_embeddings_is_scoped_to_project() {
+        let directory = tempfile::tempdir().expect("temporary LanceDB directory");
+        let store = LanceStore::open_with_dim(directory.path(), 4)
+            .await
+            .expect("open LanceDB");
+
+        store
+            .insert_code_embedding(
+                "keep",
+                &[1.0, 0.0, 0.0, 0.0],
+                "keep",
+                "function",
+                "project-a",
+                Some("src/a.rs"),
+                Some("rust"),
+            )
+            .await
+            .expect("insert project A");
+        store
+            .insert_code_embedding(
+                "replace",
+                &[0.0, 1.0, 0.0, 0.0],
+                "replace",
+                "function",
+                "project-b",
+                Some("src/b.rs"),
+                Some("rust"),
+            )
+            .await
+            .expect("insert project B");
+
+        store
+            .delete_code_embeddings_for_project("project-b")
+            .await
+            .expect("delete project B");
+
+        let results = store
+            .search_code(&[1.0, 0.0, 0.0, 0.0], 10)
+            .await
+            .expect("search after delete");
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "keep");
+        assert_eq!(results[0].project_id, "project-a");
     }
 }

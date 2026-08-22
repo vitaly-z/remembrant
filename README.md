@@ -8,16 +8,17 @@ No agent works in isolation anymore. Every session builds on everything that cam
 
 ## Key Features
 
-- **Multi-Agent Ingestion** — Native parsers for Claude Code (JSONL), Codex CLI (SQLite), and Gemini CLI (JSON)
-- **Triple-Database Architecture** — DuckDB (structured + graph via DuckPGQ), LanceDB (vector search), in-memory graph (fallback)
+- **Multi-Agent Ingestion** — Native parsers for Claude Code, Codex CLI, and Gemini CLI, plus YAML-configured SQLite and JSONL adapters
+- **Triple-Database Architecture** — DuckDB (structured data and a persistent property graph), LanceDB (vector search), and an in-memory graph backend for tests/fallback
 - **Semantic XPath** — Tree-structured memory queries based on [arXiv:2603.01160](https://arxiv.org/abs/2603.01160), 176.7% better recall than flat RAG
-- **DuckPGQ Graph Queries** — SQL/PGQ property graph: PageRank, shortest path, pattern matching — all inside DuckDB
+- **Graph Analytics** — Directed shortest path, PageRank, and edge-kind traversal directly over DuckDB graph tables; optional DuckPGQ extension loading is supported when installed
 - **Code Analysis** — AST parsing for 26 languages via Infiniloom integration (feature-gated)
-- **Repository Embedding** — Embed entire codebases with BLAKE3 content-addressable chunks
+- **Repository Embedding** — Embed entire codebases with content-addressable chunks and idempotent `--update` replacement
 - **Security Scanning** — Secret detection and redaction before embedding (via Infiniloom)
 - **LLM Distillation** — Extract insights, patterns, and decisions from raw sessions
-- **File Watching** — Real-time monitoring of agent artifact directories
-- **Web Dashboard** — Built-in web UI for visual exploration
+- **File Watching** — Debounced filesystem events for JSON/JSONL artifacts and agent MEMORY.md files, with polling only for dynamic SQLite adapters
+- **Web Dashboard and API** — Built-in same-origin web UI, analytics, and REST endpoints
+- **MCP Server** — Stateless Model Context Protocol `2026-07-28` over stdio, with legacy initialize compatibility
 - **Local-First** — All data stays local; uses LM Studio for embeddings
 
 ## Quick Start
@@ -59,7 +60,7 @@ rem analyze /path/to/project
 
 ```
                     +-----------+
-                    |  rem CLI  |  22 commands
+                    |  rem CLI  |  26 commands
                     +-----+-----+
                           |
                     +-----+-----+
@@ -70,13 +71,13 @@ rem analyze /path/to/project
           |               |               |
     +-----+-----+  +-----+-----+  +------+------+
     |  DuckDB   |  |  LanceDB  |  | Graph Store |
-    |  + DuckPGQ|  |  (Vector)  |  | (In-Memory) |
+                    |  + Graph  |  |  (Vector)  |  | (In-Memory) |
     +-----------+  +-----------+  +-------------+
 ```
 
 ### DuckDB (Structured Data + Property Graph)
 
-Stores all structured data and provides SQL/PGQ graph queries:
+Stores all structured data and provides persistent property-graph tables and graph algorithms:
 
 | Table | Purpose |
 |-------|---------|
@@ -87,37 +88,21 @@ Stores all structured data and provides SQL/PGQ graph queries:
 | `file_stats` | File statistics (LOC, complexity, change frequency) |
 | `code_symbols` | AST-parsed symbols (functions, classes, structs) |
 | `code_dependencies` | Import/call dependencies between files |
-| `graph_nodes` | Property graph nodes (via DuckPGQ) |
-| `graph_edges` | Property graph edges (via DuckPGQ) |
+| `graph_nodes` | Property graph nodes (kind, name, JSON properties) |
+| `graph_edges` | Property graph edges (kind, JSON properties) |
+| `memory_tags` | Case-insensitive tags for manual notes |
 
 ### LanceDB (Vector Embeddings)
 
 | Table | Purpose |
 |-------|---------|
-| `embeddings` | Session/memory embeddings for semantic search |
+| `code_embeddings` | Session/code-change/tool embeddings for semantic search |
+| `memory_embeddings` | Memory embeddings for semantic search |
 | `symbol_embeddings` | Code symbol embeddings with PageRank scores |
 
-### DuckPGQ (Property Graph)
+### Property graph
 
-DuckPGQ extends DuckDB with SQL/PGQ for graph operations — no separate graph database needed:
-
-```sql
--- Shortest path between two code entities
-SELECT * FROM GRAPH_TABLE(memory_graph
-  MATCH (a:Node)-[p:Edge]->{1,5}(b:Node)
-  WHERE a.id = 'fn-auth' AND b.id = 'fn-jwt'
-  COLUMNS (path_length(p))
-);
-
--- PageRank across the knowledge graph
-SELECT node_id, pagerank FROM pgq_pagerank('memory_graph', 'Node', 'Edge');
-
--- Pattern matching
-SELECT * FROM GRAPH_TABLE(memory_graph
-  MATCH (a:Node)-[:CALLS]->(b:Node)-[:IMPORTS]->(c:Node)
-  COLUMNS (a.name, b.name, c.name)
-);
-```
+Graph nodes and edges are ordinary DuckDB rows, so the graph survives restarts without a second database. `DuckStore` implements deterministic BFS shortest paths, iterative PageRank with dangling-node handling, and incoming/outgoing edge-kind matching directly against those tables. `init_graph()` and `load_duckpgq()` remain available for installations that have the optional DuckPGQ extension, but graph features do not require it.
 
 ## Semantic XPath
 
@@ -127,8 +112,8 @@ Based on the paper ["Semantic XPath: Tree-Structured Memory Access for LLM Agent
 Root
 ├── Project "remembrant"
 │   ├── Session "2026-03-20T14:30:00"
-│   │   ├── Decision "use DuckPGQ for graph"
-│   │   ├── Memory "DuckPGQ supports PageRank"
+│   │   ├── Decision "persist the graph in DuckDB"
+│   │   ├── Memory "PageRank handles dangling nodes"
 │   │   └── ToolCall "cargo test"
 │   └── Session "2026-03-21T09:00:00"
 │       └── CodeEntity "graph_builder.rs"
@@ -157,15 +142,16 @@ rem xpath '/Root/Project[@name="remembrant"]/Session/Decision'
 rem xpath '//Session[node~"refactor"]/Decision[node~"performance"]'
 ```
 
-The `~` operator triggers semantic similarity scoring (cosine similarity via LM Studio embeddings), while `@attr="value"` does exact attribute matching.
+The `~` operator applies semantic similarity scoring, while `@attr="value"` does exact matching. The CLI evaluator uses the deterministic keyword scorer by default so XPath works without a running embedding service.
 
 ## Supported Agents
 
 | Agent | Artifact Location | Format |
 |-------|------------------|--------|
 | **Claude Code** | `~/.claude/projects/*/` | JSONL transcripts + MEMORY.md |
-| **Codex CLI** | `~/.codex/sessions/` | SQLite database |
+| **Codex CLI** | `~/.codex/sessions/` | Rollout JSONL + `history.jsonl` |
 | **Gemini CLI** | `~/.gemini/tmp/*/chats/` | JSON session files |
+| **Configured agents** | Any local path | Generic SQLite or JSONL mappings |
 
 ## CLI Reference
 
@@ -175,7 +161,7 @@ The `~` operator triggers semantic similarity scoring (cosine similarity via LM 
 | `rem watch` | Start file watcher daemon |
 | `rem stop` | Stop the watcher daemon |
 | `rem ingest` | Ingest sessions from all agents |
-| `rem search <query>` | Semantic search (with `--project`, `--agent`, `--since` filters) |
+| `rem search <query>` | Hybrid semantic search (`--project`, `--agent`, `--type`, `--since`, `--json`) |
 | `rem find <text>` | Exact text search |
 | `rem recent` | Show recent sessions |
 | `rem brief` | Daily context briefing |
@@ -184,15 +170,19 @@ The `~` operator triggers semantic similarity scoring (cosine similarity via LM 
 | `rem related <path>` | Find related content for a file |
 | `rem graph <path>` | Show dependency graph |
 | `rem timeline <topic>` | Chronological topic view |
-| `rem note <text>` | Add a manual note |
+| `rem note <text>` | Add a manual note with persistent `--tag` values |
 | `rem forget --session <id>` | Remove a session |
 | `rem export` | Generate agent memory files |
-| `rem embed <path>` | Embed a repository for code search |
+| `rem embed <path>` | Embed a repository; `--update` replaces stale project vectors |
 | `rem xpath <query>` | Semantic XPath query |
 | `rem analyze <path>` | AST code analysis (requires `code-analysis` feature) |
 | `rem status` | Show daemon and database status |
 | `rem stats` | Show analytics and statistics |
 | `rem gc` | Garbage collect old/orphaned data |
+| `rem context` | Assemble a token-budgeted project context |
+| `rem consolidate` | Merge and decay related memories |
+| `rem web` | Serve the local dashboard and REST API |
+| `rem mcp` | Serve MCP tools over newline-delimited stdio JSON-RPC |
 
 ## Code Analysis (Feature-Gated)
 
@@ -216,31 +206,54 @@ rem xpath '//CodeEntity/Symbol[@kind="function"]'
 
 ## Configuration
 
-Config lives at `~/.config/remembrant/config.toml`:
+Config lives at `~/.remembrant/config.yaml` and is created on first use. Paths accept a leading `~`:
 
-```toml
-[storage]
-duckdb_path = "~/.remembrant/data.db"
-lancedb_path = "~/.remembrant/lance"
+```yaml
+storage:
+  duckdb_path: ~/.remembrant/remembrant.duckdb
+  lancedb_path: ~/.remembrant/lancedb
 
-[agents.claude_code]
-enabled = true
-watch_path = "~/.claude/projects"
+agents:
+  claude_code:
+    enabled: true
+    path: ~/.claude
+  codex:
+    enabled: true
+    path: ~/.codex
+  gemini:
+    enabled: true
+    path: ~/.gemini
+  dynamic:
+    - id: custom_jsonl_agent
+      display_name: Custom JSONL Agent
+      enabled: true
+      path: ~/.custom-agent
+      adapter_type: jsonl
+      jsonl:
+        file_pattern: "**/*.jsonl"
+        session_id_path: session.id
+        timestamp_path: timestamp
+        content_path: message.text
+        tool_name_path: tool.name
+        tool_call_type: kind=tool
 
-[agents.codex]
-enabled = true
-db_path = "~/.codex/sessions"
+embedding:
+  model: text-embedding-nomic-embed-text-v1.5@q8_0
+  endpoint: http://localhost:1234/v1
+  batch_size: 100
+  dimensions: 768
 
-[agents.gemini]
-enabled = true
-watch_path = "~/.gemini/tmp"
-
-[embedding]
-provider = "lmstudio"
-model = "nomic-embed-text"
-endpoint = "http://localhost:1234/v1"
-dimensions = 768
+watch:
+  debounce_ms: 5000
 ```
+
+Dynamic SQLite adapters use `adapter_type: sqlite` with table/column mappings under a `sqlite:` key. Unsupported adapter types fail explicitly rather than being ignored.
+
+## Web dashboard and MCP
+
+Run `rem web --port 7878` for the dashboard at `http://127.0.0.1:7878`. Static assets are embedded in the binary, and the API is same-origin; no permissive CORS layer is enabled.
+
+Run `rem mcp` for an MCP stdio server. It implements the stateless `2026-07-28` protocol, including `server/discover`, deterministic cacheable `tools/list` metadata, per-request `_meta` protocol validation, and `tools/call`. Legacy `initialize` clients remain supported. Nine memory tools are exposed: search, recall, add, context, XPath, decision recording, update, delete, and fact revision.
 
 ## Project Structure
 
@@ -249,14 +262,16 @@ remembrant/
 ├── engine/                    # Core library (remembrant-engine)
 │   ├── src/
 │   │   ├── store/
-│   │   │   ├── duckdb.rs      # DuckStore + DuckPGQ graph queries
+│   │   │   ├── duckdb.rs      # DuckStore + persistent graph algorithms
 │   │   │   ├── lance.rs       # LanceStore (vector + symbol embeddings)
 │   │   │   ├── graph.rs       # In-memory GraphStore + GraphStoreBackend trait
 │   │   │   └── mod.rs
 │   │   ├── ingest/
 │   │   │   ├── claude.rs      # Claude Code parser (JSONL)
-│   │   │   ├── codex.rs       # Codex CLI parser (SQLite)
-│   │   │   └── gemini.rs      # Gemini CLI parser (JSON)
+│   │   │   ├── codex.rs       # Codex CLI parser (JSONL)
+│   │   │   ├── gemini.rs      # Gemini CLI parser (JSON)
+│   │   │   ├── jsonl_adapter.rs # Generic YAML-mapped JSONL adapter
+│   │   │   └── native_adapters.rs # Config-aware adapter registry
 │   │   ├── semantic_tree.rs   # Tree-structured memory model (TreeBuilder, TreeNode)
 │   │   ├── xpath_query.rs     # Semantic XPath parser + evaluator
 │   │   ├── semantic_scorer.rs # Embedding-based semantic similarity scoring
@@ -272,7 +287,10 @@ remembrant/
 │   │   └── config.rs          # AppConfig
 │   └── tests/                 # Integration tests
 ├── cli/                       # CLI binary (rem)
-│   └── src/main.rs            # 22 subcommands
+│   ├── src/main.rs            # 26 subcommands, REST API, MCP entry point
+│   ├── src/mcp_server.rs      # MCP 2026-07-28 stdio server
+│   ├── src/web_dashboard.*    # Embedded HTML/CSS/JS dashboard
+│   └── tests/e2e.rs           # CLI, watcher, dashboard, and MCP E2E
 ├── .github/workflows/         # CI/CD
 ├── AGENTS.md                  # Guidelines for AI coding agents
 └── Cargo.toml                 # Workspace config (edition 2024)
@@ -284,8 +302,11 @@ remembrant/
 # Build the workspace
 cargo build
 
-# Run all tests (167 tests)
-cargo test
+# Run all default tests, including CLI E2E
+cargo test --workspace --all-targets
+
+# Verify the optional Infiniloom integration
+cargo test --workspace --all-targets --features code-analysis
 
 # Build with code-analysis feature
 cargo build --features code-analysis
@@ -296,23 +317,27 @@ cargo test -p remembrant
 
 # Format and lint
 cargo fmt --all
-cargo clippy --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --features code-analysis -- -D warnings
+
+# Dashboard JavaScript syntax gate
+node --check cli/src/web_dashboard.js
 ```
 
 ### Key Design Decisions
 
 - **Edition 2024 Rust** — latest language features
 - **Generic GraphBuilder** — `GraphBuilder<B: GraphBackend>` works with both in-memory and DuckDB backends
-- **DuckPGQ over separate graph DB** — zero data sync, same tables, built-in PageRank
+- **One DuckDB graph store** — no graph-database sync; algorithms work without optional extensions
 - **Feature-gated Infiniloom** — optional `code-analysis` feature avoids heavy tree-sitter deps when not needed
-- **Content-addressable chunks** — BLAKE3 hashing for deduplication
+- **Content-addressable chunks** — BLAKE3 with code analysis, stable SHA-256 fallback IDs otherwise
 - **Secrets never embedded** — security scanning runs before chunking/embedding
 
 ## How It Works
 
 1. **Detect** — Scan for installed agents (Claude Code, Codex, Gemini)
 2. **Ingest** — Agent-specific parsers extract sessions, tool calls, decisions, memories
-3. **Store** — Structured data goes to DuckDB, graph relationships built via DuckPGQ
+3. **Store** — Structured data goes to DuckDB; graph relationships persist in `graph_nodes` and `graph_edges`
 4. **Embed** — LM Studio generates embeddings, stored in LanceDB
 5. **Index** — Build hierarchical memory tree (Project > Session > Decision/Memory/ToolCall/CodeEntity > Symbol)
 6. **Query** — CLI provides semantic search, XPath queries, graph traversal, and analytics

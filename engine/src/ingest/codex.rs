@@ -126,10 +126,9 @@ impl CodexIngester {
     /// Returns `None` if the home directory cannot be resolved or `~/.codex`
     /// does not exist.
     pub fn new() -> Option<Self> {
-        let home = std::env::var_os("HOME").map(PathBuf::from).or_else(|| {
-            #[allow(deprecated)]
-            std::env::home_dir()
-        })?;
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir)?;
         let base = home.join(".codex");
         if base.is_dir() {
             Some(Self { base_path: base })
@@ -681,7 +680,7 @@ mod tests {
     }
 
     fn sample_session_jsonl() -> String {
-        let lines = vec![
+        let lines = [
             r#"{"timestamp":"2026-03-05T05:00:04.837Z","type":"session_meta","payload":{"id":"019cbc5e-test-id","timestamp":"2026-03-05T05:00:04.618Z","cwd":"/home/user/myproject","originator":"codex_exec","cli_version":"0.107.0","source":"exec","model_provider":"openai","git":{"commit_hash":"abc123","branch":"main","repository_url":"https://github.com/alice/myrepo.git"}}}"#,
             r#"{"timestamp":"2026-03-05T05:00:05.000Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"Fix the bug"}]}}"#,
             r#"{"timestamp":"2026-03-05T05:00:06.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I will fix it."}]}}"#,

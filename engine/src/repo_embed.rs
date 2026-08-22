@@ -3,6 +3,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 // Conditional imports for code-analysis feature
@@ -72,6 +73,23 @@ const SKIP_DIRS: &[&str] = &[
 /// indicating likely binary content.
 fn looks_binary(buf: &[u8]) -> bool {
     buf.contains(&0)
+}
+
+/// Stable fallback ID for builds without BLAKE3/Infiniloom.
+///
+/// It includes project, path, line span, and content so a changed file gets a
+/// new ID even when AST chunk metadata is unavailable.
+fn stable_chunk_id(project_id: &str, chunk: &CodeChunk) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(project_id.as_bytes());
+    hasher.update([0]);
+    hasher.update(chunk.file_path.as_bytes());
+    hasher.update([0]);
+    hasher.update(chunk.start_line.to_le_bytes());
+    hasher.update(chunk.end_line.to_le_bytes());
+    hasher.update([0]);
+    hasher.update(chunk.content.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 // ---------------------------------------------------------------------------
@@ -462,7 +480,7 @@ impl RepoEmbedder {
                 }
             }
 
-            return Ok(chunks);
+            Ok(chunks)
         }
 
         // Fallback: naive line-based chunker (no feature flag).
@@ -478,6 +496,12 @@ impl RepoEmbedder {
     /// `IncrementalScanner` to skip files that haven't changed since the last
     /// run (based on mtime + size + content hash).
     pub fn chunk_all(&self) -> Result<(Vec<CodeChunk>, usize)> {
+        self.chunk_all_with_mode(false)
+    }
+
+    /// Discover and chunk files, optionally forcing changed-file caches to be
+    /// ignored. A forced scan is used by `rem embed --update`.
+    pub fn chunk_all_with_mode(&self, _force_rescan: bool) -> Result<(Vec<CodeChunk>, usize)> {
         let files = self.discover_files()?;
         let file_count = files.len();
         info!(files = file_count, root = %self.root.display(), "discovered files");
@@ -491,7 +515,7 @@ impl RepoEmbedder {
 
             for file in &files {
                 // Skip files that haven't changed since last scan.
-                if !scanner.needs_rescan(file) {
+                if !_force_rescan && !scanner.needs_rescan(file) {
                     skipped += 1;
                     continue;
                 }
@@ -580,7 +604,35 @@ impl RepoEmbedder {
         lance_store: &crate::store::LanceStore,
         batch_size: usize,
     ) -> Result<EmbedResult> {
-        let (chunks, file_count) = self.chunk_all()?;
+        self.embed_and_store_with_update(provider, lance_store, batch_size, false)
+            .await
+    }
+
+    /// Embed and store chunks, optionally replacing all prior embeddings for
+    /// this project. The non-update path is idempotent for unchanged chunks.
+    pub async fn embed_and_store_with_update<P: crate::embedding::EmbedProvider>(
+        &self,
+        provider: &P,
+        lance_store: &crate::store::LanceStore,
+        batch_size: usize,
+        update: bool,
+    ) -> Result<EmbedResult> {
+        let (mut chunks, file_count) = self.chunk_all_with_mode(update)?;
+        if !update {
+            let existing_ids: std::collections::HashSet<String> = lance_store
+                .get_code_embedding_ids_for_project(&self.project_id)
+                .await?
+                .into_iter()
+                .collect();
+            chunks.retain(|chunk| {
+                let chunk_id = chunk
+                    .blake3_id
+                    .clone()
+                    .unwrap_or_else(|| stable_chunk_id(&self.project_id, chunk));
+                !existing_ids.contains(&chunk_id)
+            });
+        }
+
         let total_chunks = chunks.len();
 
         let mut result = EmbedResult {
@@ -621,6 +673,11 @@ impl RepoEmbedder {
         }
 
         // Store each chunk with its embedding.
+        if update && total_chunks > 0 && all_vectors.iter().any(|vector| !vector.is_empty()) {
+            lance_store
+                .delete_code_embeddings_for_project(&self.project_id)
+                .await?;
+        }
         for (idx, chunk) in chunks.iter().enumerate() {
             let embedding = &all_vectors[idx];
             if embedding.is_empty() {
@@ -629,12 +686,10 @@ impl RepoEmbedder {
             }
 
             // Use BLAKE3 ID when available, otherwise fall back to positional ID.
-            let id = chunk.blake3_id.clone().unwrap_or_else(|| {
-                format!(
-                    "{}:{}:{}:{}",
-                    self.project_id, chunk.file_path, chunk.start_line, chunk.end_line
-                )
-            });
+            let id = chunk
+                .blake3_id
+                .clone()
+                .unwrap_or_else(|| stable_chunk_id(&self.project_id, chunk));
 
             match lance_store
                 .insert_code_embedding(
@@ -941,6 +996,71 @@ mod tests {
         assert_eq!(result.findings_count, 0);
         assert_eq!(result.critical_count, 0);
         assert_eq!(result.high_count, 0);
+    }
+
+    #[tokio::test]
+    async fn test_repository_embedding_is_idempotent_and_update_replaces() {
+        use crate::embedding::MockEmbedder;
+        use crate::store::LanceStore;
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("main.rs"), "fn original() {}\n").unwrap();
+
+        let lance = LanceStore::open_with_dim(directory.path(), 8)
+            .await
+            .unwrap();
+        let embedder = RepoEmbedder::new(root.path());
+        let provider = MockEmbedder::new(8);
+
+        let first = embedder
+            .embed_and_store(&provider, &lance, 10)
+            .await
+            .unwrap();
+        assert_eq!(first.chunks_embedded, 1);
+        assert_eq!(
+            lance
+                .get_code_embedding_ids_for_project(embedder.project_id())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let unchanged = embedder
+            .embed_and_store(&provider, &lance, 10)
+            .await
+            .unwrap();
+        assert_eq!(unchanged.chunks_embedded, 0);
+
+        fs::write(root.path().join("main.rs"), "fn replacement() {}\n").unwrap();
+        let changed = embedder
+            .embed_and_store(&provider, &lance, 10)
+            .await
+            .unwrap();
+        assert_eq!(changed.chunks_embedded, 1);
+        assert_eq!(
+            lance
+                .get_code_embedding_ids_for_project(embedder.project_id())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let updated = embedder
+            .embed_and_store_with_update(&provider, &lance, 10, true)
+            .await
+            .unwrap();
+        assert_eq!(updated.chunks_embedded, 1);
+        assert_eq!(
+            lance
+                .get_code_embedding_ids_for_project(embedder.project_id())
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }
 

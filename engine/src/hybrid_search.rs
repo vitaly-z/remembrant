@@ -10,10 +10,10 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
 use crate::embedding::EmbedProvider;
+use crate::graph_builder::GraphBackend;
 use crate::semantic_scorer::keyword_scorer;
 use crate::semantic_tree::TreeBuilder;
 use crate::store::duckdb::DuckStore;
-use crate::store::graph::{GraphStore, GraphStoreBackend};
 use crate::store::lance::LanceStore;
 use crate::xpath_query;
 
@@ -283,7 +283,7 @@ impl<'a> HybridSearch<'a> {
         query: &str,
         limit: usize,
         lance: Option<&LanceStore>,
-        graph: Option<&GraphStore>,
+        graph: Option<&dyn GraphBackend>,
         embedder: Option<&P>,
     ) -> Result<Vec<HybridResult>> {
         let mut ranked_lists: Vec<(Vec<RankedResult>, f64)> = Vec::new();
@@ -443,7 +443,7 @@ impl<'a> HybridSearch<'a> {
         query: &str,
         limit: usize,
         lance: Option<&LanceStore>,
-        graph: Option<&GraphStore>,
+        graph: Option<&dyn GraphBackend>,
         embedder: Option<&P>,
     ) -> Result<(Vec<HybridResult>, QueryComplexity)> {
         let complexity = classify_query(query);
@@ -472,7 +472,7 @@ impl<'a> HybridSearch<'a> {
         query: &str,
         limit: usize,
         lance: Option<&LanceStore>,
-        graph: Option<&GraphStore>,
+        graph: Option<&dyn GraphBackend>,
         embedder: Option<&P>,
     ) -> Result<Vec<HybridResult>> {
         let trimmed = query.trim();
@@ -811,7 +811,11 @@ impl<'a> HybridSearch<'a> {
     // Internal: graph proximity search (returns ranked list for RRF)
     // -----------------------------------------------------------------------
 
-    fn search_graph_ranked(&self, query: &str, graph: &GraphStore) -> Result<Vec<RankedResult>> {
+    fn search_graph_ranked(
+        &self,
+        query: &str,
+        graph: &dyn GraphBackend,
+    ) -> Result<Vec<RankedResult>> {
         let mut results: Vec<RankedResult> = Vec::new();
         let query_lower = query.to_lowercase();
         let query_words: Vec<&str> = query_lower.split_whitespace().collect();
@@ -819,8 +823,8 @@ impl<'a> HybridSearch<'a> {
         // Find graph nodes whose names match query words
         // Then include their neighbors as related results
         if let Ok(all_nodes) = graph.all_nodes() {
-            for node in &all_nodes {
-                let name_lower = node.name.to_lowercase();
+            for (node_id, node_kind, node_name, _properties) in &all_nodes {
+                let name_lower = node_name.to_lowercase();
                 let word_matches = query_words
                     .iter()
                     .filter(|w| name_lower.contains(*w))
@@ -833,13 +837,11 @@ impl<'a> HybridSearch<'a> {
                 let match_score = word_matches as f64 / query_words.len().max(1) as f64;
 
                 results.push(RankedResult {
-                    id: node.id.clone(),
-                    content: node.name.clone(),
-                    result_type: match node.kind {
-                        crate::store::graph::NodeKind::Memory => ResultType::Memory,
-                        crate::store::graph::NodeKind::CodeEntity
-                        | crate::store::graph::NodeKind::Symbol
-                        | crate::store::graph::NodeKind::Module => ResultType::CodeEntity,
+                    id: node_id.clone(),
+                    content: node_name.clone(),
+                    result_type: match node_kind.as_str() {
+                        "Memory" => ResultType::Memory,
+                        "CodeEntity" | "Symbol" | "Module" => ResultType::CodeEntity,
                         _ => ResultType::Session,
                     },
                     raw_score: match_score,
@@ -848,18 +850,18 @@ impl<'a> HybridSearch<'a> {
                 });
 
                 // Also add neighbors with decayed score
-                if let Ok(neighbors) = graph.query_neighbors(&node.id, None) {
+                if let Ok(neighbors) = graph.query_neighbors(node_id, None) {
                     for n in neighbors.iter().take(5) {
                         results.push(RankedResult {
-                            id: n.node.id.clone(),
-                            content: n.node.name.clone(),
+                            id: n.id.clone(),
+                            content: n.name.clone(),
                             result_type: ResultType::Session,
                             raw_score: match_score * 0.5, // Neighbors get half the score
                             sources: vec!["graph_neighbor".to_string()],
                             metadata: {
                                 let mut m = HashMap::new();
-                                m.insert("edge_kind".to_string(), n.edge_kind.name().to_string());
-                                m.insert("via".to_string(), node.id.clone());
+                                m.insert("edge_kind".to_string(), n.edge_kind.clone());
+                                m.insert("via".to_string(), node_id.clone());
                                 m
                             },
                         });
@@ -964,6 +966,10 @@ fn parse_node_type_and_id(node_id: &str, node_type: &str) -> (ResultType, String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding::MockEmbedder;
+    use crate::store::graph::{
+        EdgeKind, GraphEdge, GraphNode, GraphStore, GraphStoreBackend, NodeKind,
+    };
 
     #[test]
     fn test_text_only_search() {
@@ -1050,6 +1056,43 @@ mod tests {
         assert!(!results.is_empty());
         // RRF score = weight / (k + rank) = 0.9 / (60 + 1) ≈ 0.0147 for rank 0
         assert!(results[0].score > 0.0, "RRF score should be positive");
+    }
+
+    #[tokio::test]
+    async fn test_graph_layer_accepts_any_backend() {
+        let store = DuckStore::open_in_memory().unwrap();
+        let graph = GraphStore::new();
+        GraphStoreBackend::add_node(
+            &graph,
+            &GraphNode {
+                id: "memory:m-1".into(),
+                kind: NodeKind::Memory,
+                name: "authentication uses JWT".into(),
+                properties: Default::default(),
+            },
+        )
+        .unwrap();
+        GraphStoreBackend::add_edge(
+            &graph,
+            &GraphEdge {
+                from_id: "memory:m-1".into(),
+                to_id: "session:s-1".into(),
+                kind: EdgeKind::DerivedFrom,
+                properties: Default::default(),
+            },
+        )
+        .unwrap();
+        // The session endpoint does not need to exist for this traversal test;
+        // only the matching Memory node is required.
+
+        let search = HybridSearch::new(&store);
+        let results = search
+            .search::<MockEmbedder>("authentication", 10, None, Some(&graph), None)
+            .await
+            .unwrap();
+        assert!(results.iter().any(
+            |result| result.id == "memory:m-1" && result.sources.contains(&"graph".to_string())
+        ));
     }
 
     #[test]
