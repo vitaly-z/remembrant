@@ -58,7 +58,7 @@ impl SemanticScorer {
         let refs: Vec<&str> = texts.iter().map(|s| s.as_str()).collect();
         let embeddings = provider.embed_texts(&refs).await?;
 
-        for (text, embedding) in texts.into_iter().zip(embeddings.into_iter()) {
+        for (text, embedding) in texts.into_iter().zip(embeddings) {
             self.cache.insert(text, embedding);
         }
 
@@ -106,7 +106,7 @@ impl SemanticScorer {
         let refs: Vec<&str> = new_texts.to_vec();
         let embeddings = provider.embed_texts(&refs).await?;
 
-        for (text, embedding) in new_texts.into_iter().zip(embeddings.into_iter()) {
+        for (text, embedding) in new_texts.into_iter().zip(embeddings) {
             self.cache.insert(text.to_string(), embedding);
         }
 

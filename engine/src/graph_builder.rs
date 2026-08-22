@@ -384,7 +384,7 @@ impl<B: GraphBackend> GraphBuilder<B> {
 
     /// Add a session as a node with edges to its project.
     pub fn add_session(&self, session: &Session) -> Result<()> {
-        let fallback = format!("Session {}", &session.id);
+        let fallback = format!("Session {}", session.id);
         let name = session.summary.as_deref().unwrap_or(&fallback);
         let name = truncate_str(name, 80);
 
