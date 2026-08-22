@@ -4,7 +4,7 @@ Guidelines for AI coding agents working on the Remembrant codebase.
 
 ## Project Overview
 
-Remembrant is a Rust-based CLI tool (`rem`) that ingests coding agent artifacts from Claude Code, Codex CLI, and Gemini CLI into DuckDB (structured rows plus a persistent property graph) and LanceDB for shared persistent memory across AI coding agents. It includes Semantic XPath, a local web dashboard/API, a stateless MCP server, optional 26-language code analysis via Infiniloom, and generic SQLite/JSONL agent adapters.
+Remembrant is a Rust-based CLI tool (`rem`) that ingests coding agent artifacts from Claude Code, Codex CLI, and Gemini CLI into DuckDB (structured rows plus a persistent property graph) and LanceDB for shared persistent memory across AI coding agents. It includes Semantic XPath, a local web dashboard/API, a stateless MCP server, and generic SQLite/JSONL agent adapters.
 
 ## Architecture
 
@@ -13,7 +13,7 @@ Remembrant is a Rust-based CLI tool (`rem`) that ingests coding agent artifacts 
 This is a Cargo workspace (edition 2024) with two crates:
 
 - **engine** (`remembrant-engine`): Core library — ingestion, storage, search, graph, Semantic XPath
-- **cli** (`remembrant`): Binary crate providing the `rem` CLI tool (26 commands), web dashboard/API, and MCP stdio server
+- **cli** (`remembrant`): Binary crate providing the `rem` CLI tool (25 commands), web dashboard/API, and MCP stdio server
 
 ### Key Modules
 
@@ -32,7 +32,6 @@ This is a Cargo workspace (edition 2024) with two crates:
 - `xpath_query.rs` — XPathQuery parser + evaluator (weighted-set algorithm from arXiv:2603.01160)
 - `semantic_scorer.rs` — SemanticScorer (embedding cache) + keyword_scorer (fallback)
 - `graph_builder.rs` — `GraphBuilder<B: GraphBackend>` generic over backend (in-memory or DuckDB)
-- `code_analysis.rs` — Infiniloom bridge (feature-gated: `code-analysis`)
 - `repo_embed.rs` — RepoEmbedder (AST/line chunking, content-addressable IDs, update-aware replacement)
 - `embed_pipeline.rs` — EmbedPipeline for batching embeddings
 - `embedding.rs` — EmbedProvider trait (LmStudioEmbedder, MockEmbedder)
@@ -44,7 +43,7 @@ This is a Cargo workspace (edition 2024) with two crates:
 - `timeutil.rs` — timezone-aware local-day windows (`DayWindow`) for all "today" queries
 
 **cli/src/**:
-- `main.rs` — 26 subcommands: init, watch, stop, search, find, recent, brief, context, consolidate, patterns, decisions, related, graph, timeline, note, forget, export, embed, ingest, status, stats, gc, analyze, web, mcp, xpath
+- `main.rs` — 25 subcommands: init, watch, stop, search, find, recent, brief, context, consolidate, patterns, decisions, related, graph, timeline, note, forget, export, embed, ingest, status, stats, gc, web, mcp, xpath
 - `mcp_server.rs` — MCP `2026-07-28` stdio server with legacy initialize compatibility
 - `web_dashboard.html/css/js` — embedded same-origin dashboard assets
 - `web_dashboard_util.js` — pure, DOM-free dashboard helpers (UMD; unit-tested via `node --test`)
@@ -55,7 +54,6 @@ This is a Cargo workspace (edition 2024) with two crates:
 ### Feature Flags
 
 - **default** — Enables the bundled generic SQLite adapter feature (`sqlite-adapters`)
-- **code-analysis** — Enables Infiniloom integration (AST parsing, secret scanning, BLAKE3 hashing). Adds `infiniloom-engine` and `blake3`.
 
 ## Development Guidelines
 
@@ -65,14 +63,8 @@ This is a Cargo workspace (edition 2024) with two crates:
 # Build the entire workspace
 cargo build
 
-# Build with code-analysis feature
-cargo build --features code-analysis
-
-# Run default unit, integration, and CLI E2E tests
+# Run unit, integration, and CLI E2E tests
 cargo test --workspace --all-targets
-
-# Run feature-gated tests
-cargo test --workspace --all-targets --features code-analysis
 
 # Run specific crate tests
 cargo test -p remembrant-engine
@@ -84,9 +76,8 @@ cargo run --bin rem -- --help
 # Format code
 cargo fmt --all
 
-# Check for issues (both feature configurations)
+# Check for issues
 cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy --workspace --all-targets --features code-analysis -- -D warnings
 
 # Check embedded dashboard JavaScript
 node --check cli/src/web_dashboard.js
@@ -184,7 +175,7 @@ impl LanceStore {
     pub async fn search_code(&self, query: &[f32], limit: usize) -> Result<Vec<CodeSearchResult>>;
     pub async fn search_memories(&self, query: &[f32], limit: usize) -> Result<Vec<MemorySearchResult>>;
 
-    // Symbol embeddings (code analysis)
+    // Symbol embeddings
     pub async fn insert_symbol_embedding(&self, symbol: SymbolEmbedding) -> Result<()>;
     pub async fn search_symbols(&self, query: &[f32], limit: usize) -> Result<Vec<SymbolSearchResult>>;
 }
@@ -228,7 +219,6 @@ for weighted_node in results {
 - Use `tempfile::tempdir()` for LanceDB paths in tests
 - CLI/E2E tests must set an isolated `HOME`; never use the developer’s real home
 - Add MCP protocol coverage in `cli/tests/e2e.rs` when changing `mcp_server.rs`
-- Feature-gated tests: `#[cfg(feature = "code-analysis")]`
 
 ### Database Schema
 
@@ -257,11 +247,10 @@ for weighted_node in results {
 3. **Handle async correctly**: LanceStore is async, DuckStore is sync — don't mix patterns
 4. **EmbedProvider generics**: Never try to use `&dyn EmbedProvider`
 5. **Tilde expansion**: Config paths use `~/` — expand with `dirs::home_dir()`
-6. **Feature gates**: Code analysis imports must be behind `#[cfg(feature = "code-analysis")]`
-7. **Dashboard is same-origin**: Do not reintroduce permissive CORS on local APIs
-8. **MCP is newline JSON-RPC**: stdout must contain responses only; logs belong on stderr
-9. **GraphBackend is all-string**: Node kind, properties are strings (serialized JSON for properties)
-10. **"Today" windows are local, not UTC**: Use `timeutil::local_day_window` and pass the boundaries into the store `*_today` / `get_daily_*` methods; never derive user-facing day windows from UTC midnight
+6. **Dashboard is same-origin**: Do not reintroduce permissive CORS on local APIs
+7. **MCP is newline JSON-RPC**: stdout must contain responses only; logs belong on stderr
+8. **GraphBackend is all-string**: Node kind, properties are strings (serialized JSON for properties)
+9. **"Today" windows are local, not UTC**: Use `timeutil::local_day_window` and pass the boundaries into the store `*_today` / `get_daily_*` methods; never derive user-facing day windows from UTC midnight
 
 ### Adding New Features
 
@@ -286,6 +275,3 @@ Key dependencies (see workspace `Cargo.toml`):
 - `reqwest` 0.12 — HTTP client (LM Studio)
 - `chrono`, `uuid` — Date/time and IDs
 
-Optional (code-analysis feature):
-- `infiniloom-engine` — AST parsing, secret scanning (26 languages)
-- `blake3` — Content-addressable hashing

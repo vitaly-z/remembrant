@@ -18,9 +18,6 @@ pub mod timeutil;
 pub mod watcher;
 pub mod xpath_query;
 
-#[cfg(feature = "code-analysis")]
-pub mod code_analysis;
-
 pub use config::AppConfig;
 pub use consolidate::{
     ConsolidationStats, DecayScore, MergeCandidate, compute_decay_scores, consolidate,
@@ -50,6 +47,3 @@ pub use xpath_query::{
     AggOp, Axis, CompOp, NodeSelect, ParseError, Predicate, QueryStep, WeightedNode, XPathQuery,
     evaluate as evaluate_xpath, parse as parse_xpath,
 };
-
-#[cfg(feature = "code-analysis")]
-pub use code_analysis::{AnalysisResult, CodeAnalyzer};

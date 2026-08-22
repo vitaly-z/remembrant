@@ -1,5 +1,11 @@
 # Remembrant — Project Plan
 
+> **Status note (2026-08):** The Infiniloom integration referenced below was
+> subsequently **excluded**. The `code-analysis` feature and the
+> `infiniloom-engine` path dependency were removed; repository embedding uses
+> the built-in line-based chunker. Infiniloom references below are historical.
+
+
 > Shared persistent memory for coding agents. Layers of knowledge, all recoverable.
 
 ## Vision

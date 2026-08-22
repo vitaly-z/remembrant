@@ -12,9 +12,7 @@ No agent works in isolation anymore. Every session builds on everything that cam
 - **Triple-Database Architecture** — DuckDB (structured data and a persistent property graph), LanceDB (vector search), and an in-memory graph backend for tests/fallback
 - **Semantic XPath** — Tree-structured memory queries based on [arXiv:2603.01160](https://arxiv.org/abs/2603.01160), 176.7% better recall than flat RAG
 - **Graph Analytics** — Directed shortest path, PageRank, and edge-kind traversal directly over DuckDB graph tables; optional DuckPGQ extension loading is supported when installed
-- **Code Analysis** — AST parsing for 26 languages via Infiniloom integration (feature-gated)
 - **Repository Embedding** — Embed entire codebases with content-addressable chunks and idempotent `--update` replacement
-- **Security Scanning** — Secret detection and redaction before embedding (via Infiniloom)
 - **LLM Distillation** — Extract insights, patterns, and decisions from raw sessions
 - **File Watching** — Debounced filesystem events for JSON/JSONL artifacts and agent MEMORY.md files, with polling only for dynamic SQLite adapters
 - **Web Dashboard and API** — Built-in same-origin web UI, analytics, and REST endpoints
@@ -44,16 +42,6 @@ rem embed /path/to/project
 
 # View stats
 rem stats
-```
-
-### With Code Analysis (26 languages)
-
-```bash
-# Build with Infiniloom integration
-cargo install --path cli --features code-analysis
-
-# Analyze a repository (AST parsing, symbol extraction, dependency graph)
-rem analyze /path/to/project
 ```
 
 ## Architecture
@@ -119,7 +107,7 @@ Root
 │       └── CodeEntity "graph_builder.rs"
 │           ├── Symbol "GraphBackend (trait)"
 │           └── Symbol "GraphBuilder (struct)"
-└── Project "infiniloom"
+└── Project "api-gateway"
     └── ...
 ```
 
@@ -175,7 +163,6 @@ The `~` operator applies semantic similarity scoring, while `@attr="value"` does
 | `rem export` | Generate agent memory files |
 | `rem embed <path>` | Embed a repository; `--update` replaces stale project vectors |
 | `rem xpath <query>` | Semantic XPath query |
-| `rem analyze <path>` | AST code analysis (requires `code-analysis` feature) |
 | `rem status` | Show daemon and database status |
 | `rem stats` | Show analytics and statistics |
 | `rem gc` | Garbage collect old/orphaned data |
@@ -183,26 +170,6 @@ The `~` operator applies semantic similarity scoring, while `@attr="value"` does
 | `rem consolidate` | Merge and decay related memories |
 | `rem web` | Serve the local dashboard and REST API |
 | `rem mcp` | Serve MCP tools over newline-delimited stdio JSON-RPC |
-
-## Code Analysis (Feature-Gated)
-
-When built with `--features code-analysis`, Remembrant integrates with [Infiniloom](https://github.com/Topos-Labs/infiniloom) for deep code understanding:
-
-- **26-language AST parsing** via tree-sitter (Python, JS, TS, Rust, Go, Java, C, C++, and 18 more)
-- **Symbol extraction** — functions, classes, structs, traits, interfaces
-- **Dependency graph** — imports, calls, inheritance relationships
-- **PageRank ranking** — identify the most important symbols in a codebase
-- **BLAKE3 content hashing** — content-addressable chunk deduplication
-- **Secret scanning** — detect and redact secrets before embedding
-
-```bash
-# Analyze a Rust project
-rem analyze /path/to/rust-project --project my-project
-
-# The symbols are stored in DuckDB and LanceDB for querying
-rem search "GraphBuilder" --type symbol
-rem xpath '//CodeEntity/Symbol[@kind="function"]'
-```
 
 ## Configuration
 
@@ -276,8 +243,7 @@ remembrant/
 │   │   ├── xpath_query.rs     # Semantic XPath parser + evaluator
 │   │   ├── semantic_scorer.rs # Embedding-based semantic similarity scoring
 │   │   ├── graph_builder.rs   # Generic GraphBuilder<B: GraphBackend>
-│   │   ├── code_analysis.rs   # Infiniloom bridge (feature-gated)
-│   │   ├── repo_embed.rs      # Repository embedder (AST chunking, secret scan)
+│   │   ├── repo_embed.rs      # Repository embedder (line chunking)
 │   │   ├── embed_pipeline.rs  # Embedding batch pipeline
 │   │   ├── embedding.rs       # EmbedProvider trait (LmStudio, Mock)
 │   │   ├── distill.rs         # LLM distillation
@@ -302,14 +268,8 @@ remembrant/
 # Build the workspace
 cargo build
 
-# Run all default tests, including CLI E2E
+# Run all tests, including CLI E2E
 cargo test --workspace --all-targets
-
-# Verify the optional Infiniloom integration
-cargo test --workspace --all-targets --features code-analysis
-
-# Build with code-analysis feature
-cargo build --features code-analysis
 
 # Run specific crate tests
 cargo test -p remembrant-engine
@@ -318,10 +278,11 @@ cargo test -p remembrant
 # Format and lint
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy --workspace --all-targets --features code-analysis -- -D warnings
 
-# Dashboard JavaScript syntax gate
+# Dashboard JavaScript syntax + unit-test gate
 node --check cli/src/web_dashboard.js
+node --check cli/src/web_dashboard_util.js
+node --test cli/js-tests/dashboard_util.test.js
 ```
 
 ### Key Design Decisions
@@ -329,9 +290,7 @@ node --check cli/src/web_dashboard.js
 - **Edition 2024 Rust** — latest language features
 - **Generic GraphBuilder** — `GraphBuilder<B: GraphBackend>` works with both in-memory and DuckDB backends
 - **One DuckDB graph store** — no graph-database sync; algorithms work without optional extensions
-- **Feature-gated Infiniloom** — optional `code-analysis` feature avoids heavy tree-sitter deps when not needed
-- **Content-addressable chunks** — BLAKE3 with code analysis, stable SHA-256 fallback IDs otherwise
-- **Secrets never embedded** — security scanning runs before chunking/embedding
+- **Stable chunk IDs** — SHA-256 content-derived IDs make re-embedding idempotent
 
 ## How It Works
 

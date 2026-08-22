@@ -256,16 +256,6 @@ enum Commands {
     /// Garbage collect old/orphaned data
     Gc,
 
-    /// Deep code analysis using Infiniloom AST parsing
-    Analyze {
-        /// Repository path to analyze
-        path: String,
-
-        /// Project ID (default: directory name)
-        #[arg(long)]
-        project: Option<String>,
-    },
-
     /// Launch web dashboard on localhost
     Web {
         /// Port to listen on
@@ -2262,50 +2252,6 @@ fn build_graph(store: &DuckStore) -> Result<GraphBuilder<&DuckStore>> {
     Ok(builder)
 }
 
-fn cmd_analyze(_path: &str, _project: Option<&str>) -> Result<()> {
-    #[cfg(not(feature = "code-analysis"))]
-    {
-        anyhow::bail!(
-            "Code analysis requires the 'code-analysis' feature.\n\
-             Rebuild with: cargo build --features code-analysis"
-        );
-    }
-
-    #[cfg(feature = "code-analysis")]
-    {
-        use remembrant_engine::code_analysis::CodeAnalyzer;
-
-        let config = AppConfig::load()?;
-        let store = open_store(&config)?;
-        let repo_path = expand_tilde(_path);
-
-        let project_id = _project.map(String::from).unwrap_or_else(|| {
-            repo_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string()
-        });
-
-        println!("Analyzing {}...", repo_path.display());
-        println!("  Project: {project_id}");
-
-        let analyzer = CodeAnalyzer::new(&project_id, &repo_path);
-
-        // Persist code graph relationships in DuckDB alongside the symbol rows.
-        let graph = GraphBuilder::with_backend(&store);
-        let result = analyzer.analyze(&store, graph.backend())?;
-
-        println!("\nAnalysis complete:");
-        println!("  Files analyzed:    {}", result.files_analyzed);
-        println!("  Symbols extracted: {}", result.symbols_extracted);
-        println!("  Dependencies:      {}", result.dependencies_found);
-        println!("  Duration:          {}ms", result.duration_ms);
-
-        Ok(())
-    }
-}
-
 async fn cmd_embed(path: &str, update: bool) -> Result<()> {
     let config = AppConfig::load()?;
     let abs_path =
@@ -3573,9 +3519,6 @@ async fn main() -> Result<()> {
         }
         Commands::Gc => {
             cmd_gc()?;
-        }
-        Commands::Analyze { path, project } => {
-            cmd_analyze(&path, project.as_deref())?;
         }
         Commands::Web { port } => {
             cmd_web(port).await?;

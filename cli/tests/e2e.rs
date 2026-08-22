@@ -472,33 +472,6 @@ async fn cli_and_dashboard_end_to_end_workflow() -> Result<()> {
     assert!(!empty_note.status.success());
     assert!(String::from_utf8_lossy(&empty_note.stderr).contains("cannot be empty"));
 
-    let analysis_repo = home.path().join("analysis-repo");
-    std::fs::create_dir_all(&analysis_repo)?;
-    std::fs::write(
-        analysis_repo.join("lib.rs"),
-        "pub fn e2e_identity(value: usize) -> usize { value }\n",
-    )?;
-    let analysis_repo = analysis_repo.to_string_lossy().to_string();
-    #[cfg(feature = "code-analysis")]
-    let analysis = assert_rem_success(
-        home.path(),
-        &["analyze", &analysis_repo, "--project", "e2e-analysis"],
-    )?;
-    #[cfg(feature = "code-analysis")]
-    assert!(
-        String::from_utf8_lossy(&analysis.stdout).contains("Symbols extracted: 1"),
-        "analysis output missing"
-    );
-    #[cfg(not(feature = "code-analysis"))]
-    {
-        let analysis = rem(home.path(), &["analyze", &analysis_repo])?;
-        assert!(!analysis.status.success());
-        assert!(
-            String::from_utf8_lossy(&analysis.stderr)
-                .contains("requires the 'code-analysis' feature")
-        );
-    }
-
     // Exercise repository embedding through a real local OpenAI-compatible
     // HTTP endpoint, including forced replacement via --update.
     let (embedding_endpoint, embedding_server) = spawn_fake_embedding_server().await?;

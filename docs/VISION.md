@@ -1,5 +1,13 @@
 # Remembrant: Vision & Roadmap
 
+> **Status note (2026-08):** The Infiniloom-based code-analysis tier described
+> below was subsequently **excluded**. The `code-analysis` feature, the
+> `infiniloom-engine` path dependency, BLAKE3 hashing, AST chunking, and secret
+> scanning have all been removed. Repository embedding now uses the built-in
+> line-based chunker with stable SHA-256-derived chunk IDs. Sections referencing
+> Infiniloom are retained for historical context only.
+
+
 ## The Goal
 
 Make Remembrant the universal memory layer for AI coding agents — 100x better than anything existing. Not just memory, but a **complete cognitive substrate**: decision tracking, code understanding, project evolution, cross-agent coordination, and analytics. Every agent session builds on everything that came before.

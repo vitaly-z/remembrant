@@ -113,7 +113,7 @@ pub struct CodeSymbol {
     pub pagerank_score: f64,
     pub reference_count: i32,
     pub language: Option<String>,
-    pub content_hash: Option<String>, // BLAKE3
+    pub content_hash: Option<String>,
     pub indexed_at: Option<NaiveDateTime>,
 }
 
