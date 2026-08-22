@@ -35,4 +35,8 @@ jobs:
       - name: Code-analysis lint
         run: cargo clippy --workspace --all-targets --features code-analysis -- -D warnings
       - name: Dashboard JavaScript syntax
-        run: node --check cli/src/web_dashboard.js
+        run: |
+          node --check cli/src/web_dashboard.js
+          node --check cli/src/web_dashboard_util.js
+      - name: Dashboard JavaScript unit tests
+        run: node --test cli/js-tests/dashboard_util.test.js

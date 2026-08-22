@@ -14,6 +14,7 @@ pub mod repo_embed;
 pub mod semantic_scorer;
 pub mod semantic_tree;
 pub mod store;
+pub mod timeutil;
 pub mod watcher;
 pub mod xpath_query;
 

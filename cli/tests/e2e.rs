@@ -804,6 +804,36 @@ async fn cli_and_dashboard_end_to_end_workflow() -> Result<()> {
             .as_array()
             .is_some_and(|files| files.iter().any(|file| file["file_path"] == "src/auth.rs"))
     );
+    // Issue #25: the briefing reports the local calendar date it used and
+    // the resolved UTC offset, so the UI can label the period honestly.
+    assert!(
+        briefing["date"]
+            .as_str()
+            .is_some_and(|d| d.len() == 10 && d.as_bytes()[4] == b'-')
+    );
+    assert!(
+        briefing["tz_offset"]
+            .as_str()
+            .is_some_and(|tz| tz.len() == 6
+                && (tz.starts_with('+') || tz.starts_with('-'))
+                && &tz[3..4] == ":")
+    );
+
+    // The unit-tested dashboard helpers must be served alongside the app.
+    let util_response = client
+        .get(format!("{base}/assets/dashboard.util.js"))
+        .send()
+        .await?
+        .error_for_status()?;
+    assert!(
+        util_response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/javascript"))
+    );
+    let util_body = util_response.text().await?;
+    assert!(util_body.contains("RemembrantUtil"));
 
     let xpath_api: Value = client
         .get(format!("{base}/api/search/xpath"))
@@ -962,6 +992,62 @@ async fn cli_and_dashboard_end_to_end_workflow() -> Result<()> {
             .iter()
             .any(|item| item["what"] == "Use UTC day boundaries")
     }));
+
+    // Issue #28: memories/facts/decisions accept repeatable ?agent= filters.
+    // The ingested session belongs to claude_code; the POSTed note/decision
+    // have no source session, so a codex/gemini filter must exclude them.
+    let memories_other_agent: Value = client
+        .get(format!("{base}/api/memories"))
+        .query(&[("agent", "codex,gemini")])
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(memories_other_agent.as_array().map(Vec::len), Some(0));
+
+    let memories_ingesting_agent: Value = client
+        .get(format!("{base}/api/memories"))
+        .query(&[("agent", "claude_code")])
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(memories_ingesting_agent.is_array());
+
+    let decisions_other_agent: Value = client
+        .get(format!("{base}/api/decisions"))
+        .query(&[("agent", "codex")])
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert_eq!(decisions_other_agent.as_array().map(Vec::len), Some(0));
+
+    let decisions_unfiltered: Value = client
+        .get(format!("{base}/api/decisions"))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(
+        decisions_unfiltered
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
+
+    let facts_filtered: Value = client
+        .get(format!("{base}/api/facts"))
+        .query(&[("agent", "codex")])
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    assert!(facts_filtered.is_array());
 
     server.kill()?;
     server.wait()?;

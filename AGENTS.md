@@ -41,11 +41,16 @@ This is a Cargo workspace (edition 2024) with two crates:
 - `pipeline.rs` — IngestPipeline for orchestrating ingestion
 - `config.rs` — AppConfig
 - `detect.rs` — Agent detection utilities
+- `timeutil.rs` — timezone-aware local-day windows (`DayWindow`) for all "today" queries
 
 **cli/src/**:
 - `main.rs` — 26 subcommands: init, watch, stop, search, find, recent, brief, context, consolidate, patterns, decisions, related, graph, timeline, note, forget, export, embed, ingest, status, stats, gc, analyze, web, mcp, xpath
 - `mcp_server.rs` — MCP `2026-07-28` stdio server with legacy initialize compatibility
 - `web_dashboard.html/css/js` — embedded same-origin dashboard assets
+- `web_dashboard_util.js` — pure, DOM-free dashboard helpers (UMD; unit-tested via `node --test`)
+
+**cli/js-tests/**:
+- `dashboard_util.test.js` — Node `node:test` unit tests for the dashboard util module
 
 ### Feature Flags
 
@@ -85,6 +90,10 @@ cargo clippy --workspace --all-targets --features code-analysis -- -D warnings
 
 # Check embedded dashboard JavaScript
 node --check cli/src/web_dashboard.js
+node --check cli/src/web_dashboard_util.js
+
+# Run dashboard JavaScript unit tests
+node --test cli/js-tests/dashboard_util.test.js
 ```
 
 ### Code Style
@@ -143,6 +152,23 @@ impl DuckStore {
     pub fn connection(&self) -> &Mutex<Connection>;
 }
 ```
+
+#### Local-day windows (never compute "today" from UTC midnight)
+
+All stored timestamps are naive UTC, but user-facing "today" windows must be
+local calendar days. Compute boundaries with `timeutil::local_day_window`
+(injectable via `day_window_in_tz` for tests) and pass them into the store:
+
+```rust
+let day = remembrant_engine::timeutil::local_day_window(chrono::Utc::now());
+let decisions = store.get_decisions_today(day.start)?;
+let recent = store.get_recent_sessions_for_briefing(day.shifted_back(1).start)?;
+let spark = store.get_daily_session_counts(6, now, &chrono::Local)?;
+```
+
+List endpoints that support per-agent filtering use the `_filtered` variants:
+`get_memories_filtered`, `get_decisions_filtered`, `get_active_facts_filtered`,
+`get_all_facts_filtered` (empty `agents` slice = no filter).
 
 #### LanceStore (Async)
 
@@ -235,6 +261,7 @@ for weighted_node in results {
 7. **Dashboard is same-origin**: Do not reintroduce permissive CORS on local APIs
 8. **MCP is newline JSON-RPC**: stdout must contain responses only; logs belong on stderr
 9. **GraphBackend is all-string**: Node kind, properties are strings (serialized JSON for properties)
+10. **"Today" windows are local, not UTC**: Use `timeutil::local_day_window` and pass the boundaries into the store `*_today` / `get_daily_*` methods; never derive user-facing day windows from UTC midnight
 
 ### Adding New Features
 
@@ -242,7 +269,7 @@ for weighted_node in results {
 2. Add tests (unit in same file, integration in `engine/tests/`)
 3. Add CLI subcommand in `cli/src/main.rs` if needed
 4. Update AGENTS.md and README.md
-5. Run both default and feature test/lint gates plus `node --check` when dashboard JS changed
+5. Run both default and feature test/lint gates plus `node --check` and `node --test cli/js-tests/` when dashboard JS changed
 
 ### Dependencies
 
