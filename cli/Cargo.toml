@@ -25,7 +25,6 @@ uuid.workspace = true
 
 [features]
 default = []
-code-analysis = ["remembrant-engine/code-analysis"]
 
 [dev-dependencies]
 reqwest.workspace = true

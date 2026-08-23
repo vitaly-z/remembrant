@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::{NaiveDateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use duckdb::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -113,7 +113,7 @@ pub struct CodeSymbol {
     pub pagerank_score: f64,
     pub reference_count: i32,
     pub language: Option<String>,
-    pub content_hash: Option<String>, // BLAKE3
+    pub content_hash: Option<String>,
     pub indexed_at: Option<NaiveDateTime>,
 }
 
@@ -146,6 +146,53 @@ pub struct AnalysisRun {
 
 fn vec_to_json(v: &[String]) -> String {
     serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// Count timestamp rows per local calendar day in `tz`.
+///
+/// `sql` must select a single `TIMESTAMP` column filtered by `>= ?`.
+fn count_by_local_day<Tz>(
+    conn: &Connection,
+    sql: &str,
+    cutoff: NaiveDateTime,
+    tz: &Tz,
+) -> Result<std::collections::HashMap<chrono::NaiveDate, i64>>
+where
+    Tz: chrono::TimeZone,
+    Tz::Offset: std::fmt::Display,
+{
+    let mut stmt = conn
+        .prepare(sql)
+        .context("failed to prepare daily count query")?;
+    let rows = stmt
+        .query_map(params![cutoff], |row| row.get::<_, NaiveDateTime>(0))
+        .context("failed to query daily count timestamps")?;
+    let mut counts: std::collections::HashMap<chrono::NaiveDate, i64> =
+        std::collections::HashMap::new();
+    for row in rows {
+        let ts = row.context("failed to read daily count row")?;
+        let local_day = ts.and_utc().with_timezone(tz).date_naive();
+        *counts.entry(local_day).or_insert(0) += 1;
+    }
+    Ok(counts)
+}
+
+/// Lower-cased identifier-like tokens of at least 3 characters, with common
+/// English stop words removed. Used to decide whether two memories are
+/// topically related (see `get_attention_items`).
+fn significant_tokens(text: &str) -> std::collections::HashSet<String> {
+    const STOP_WORDS: &[&str] = &[
+        "the", "and", "for", "with", "that", "this", "from", "are", "was", "were", "will", "have",
+        "has", "had", "not", "but", "its", "our", "out", "use", "used", "using", "than", "then",
+        "them", "they", "into", "over", "after", "before", "about", "all", "any", "can", "should",
+        "would", "could", "when", "where", "which", "who",
+    ];
+    let stop: std::collections::HashSet<&str> = STOP_WORDS.iter().copied().collect();
+    text.split(|c: char| !c.is_alphanumeric() && c != '_')
+        .filter(|tok| tok.len() >= 3)
+        .map(|tok| tok.to_lowercase())
+        .filter(|tok| !stop.contains(tok.as_str()))
+        .collect()
 }
 
 fn json_to_vec(s: &str) -> Vec<String> {
@@ -1172,35 +1219,51 @@ impl DuckStore {
 
     /// Get all currently valid facts (invalid_at IS NULL).
     pub fn get_active_facts(&self, project: Option<&str>, limit: usize) -> Result<Vec<Fact>> {
+        self.get_active_facts_filtered(project, &[], limit)
+    }
+
+    /// Get currently valid facts with optional project and source-agent
+    /// filters.
+    pub fn get_active_facts_filtered(
+        &self,
+        project: Option<&str>,
+        agents: &[String],
+        limit: usize,
+    ) -> Result<Vec<Fact>> {
         let conn = self.conn.lock().expect("lock poisoned");
 
-        let (sql, use_project) = if project.is_some() {
-            (
-                "SELECT id, project_id, subject, predicate, object, confidence,
-                        source_session_id, source_agent, valid_at, invalid_at,
-                        superseded_by, created_at
-                 FROM facts
-                 WHERE invalid_at IS NULL AND project_id ILIKE ?
-                 ORDER BY valid_at DESC NULLS LAST
-                 LIMIT ?",
-                true,
-            )
-        } else {
-            (
-                "SELECT id, project_id, subject, predicate, object, confidence,
-                        source_session_id, source_agent, valid_at, invalid_at,
-                        superseded_by, created_at
-                 FROM facts
-                 WHERE invalid_at IS NULL
-                 ORDER BY valid_at DESC NULLS LAST
-                 LIMIT ?",
-                false,
-            )
-        };
+        let mut conditions: Vec<String> = vec!["invalid_at IS NULL".to_string()];
+        let mut param_values: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
+        if let Some(project) = project {
+            conditions.push("project_id ILIKE ?".to_string());
+            param_values.push(Box::new(format!("%{project}%")));
+        }
+        if !agents.is_empty() {
+            conditions.push(format!(
+                "source_agent IN ({})",
+                vec!["?"; agents.len()].join(", ")
+            ));
+            for agent in agents {
+                param_values.push(Box::new(agent.clone()));
+            }
+        }
+        let sql = format!(
+            "SELECT id, project_id, subject, predicate, object, confidence,
+                    source_session_id, source_agent, valid_at, invalid_at,
+                    superseded_by, created_at
+             FROM facts
+             WHERE {}
+             ORDER BY valid_at DESC NULLS LAST
+             LIMIT ?",
+            conditions.join(" AND ")
+        );
+        param_values.push(Box::new(limit as i64));
 
+        let params_ref: Vec<&dyn duckdb::ToSql> =
+            param_values.iter().map(|pv| pv.as_ref()).collect();
         let mut stmt = conn
-            .prepare(sql)
-            .context("failed to prepare get_active_facts")?;
+            .prepare(&sql)
+            .context("failed to prepare get_active_facts_filtered")?;
 
         let map_row = |row: &duckdb::Row| -> duckdb::Result<Fact> {
             Ok(Fact {
@@ -1219,14 +1282,9 @@ impl DuckStore {
             })
         };
 
-        let rows = if use_project {
-            let pattern = format!("%{}%", project.unwrap());
-            stmt.query_map(params![pattern, limit as i64], map_row)
-                .context("failed to query active facts")?
-        } else {
-            stmt.query_map(params![limit as i64], map_row)
-                .context("failed to query active facts")?
-        };
+        let rows = stmt
+            .query_map(params_ref.as_slice(), map_row)
+            .context("failed to query active facts")?;
 
         let mut facts = Vec::new();
         for row in rows {
@@ -1641,12 +1699,7 @@ impl DuckStore {
     }
 
     /// Get all sessions from the current UTC calendar day.
-    pub fn get_todays_sessions(&self) -> Result<Vec<Session>> {
-        let now = Utc::now().naive_utc();
-        let since = now
-            .date()
-            .and_hms_opt(0, 0, 0)
-            .context("failed to calculate UTC day boundary")?;
+    pub fn get_todays_sessions(&self, since: NaiveDateTime) -> Result<Vec<Session>> {
         self.search_sessions(None, None, Some(since), i32::MAX as usize)
     }
 
@@ -1687,32 +1740,57 @@ impl DuckStore {
 
     /// Get all memories, optionally filtered by project.
     pub fn get_memories(&self, project: Option<&str>, limit: usize) -> Result<Vec<Memory>> {
+        self.get_memories_filtered(project, &[], limit)
+    }
+
+    /// List memories with optional project and source-agent filters.
+    ///
+    /// When `agents` is non-empty, only memories whose source session was
+    /// produced by one of the listed agents are returned; manual notes
+    /// (no source session) are excluded in that case.
+    pub fn get_memories_filtered(
+        &self,
+        project: Option<&str>,
+        agents: &[String],
+        limit: usize,
+    ) -> Result<Vec<Memory>> {
         let conn = self.conn.lock().expect("lock poisoned");
 
-        let (sql, use_project) = if project.is_some() {
-            (
-                "SELECT id, project_id, content, memory_type, source_session_id,
-                        confidence, access_count, created_at, updated_at, valid_until
-                 FROM memories
-                 WHERE project_id ILIKE ?
-                 ORDER BY updated_at DESC NULLS LAST
-                 LIMIT ?",
-                true,
-            )
-        } else {
-            (
-                "SELECT id, project_id, content, memory_type, source_session_id,
-                        confidence, access_count, created_at, updated_at, valid_until
-                 FROM memories
-                 ORDER BY updated_at DESC NULLS LAST
-                 LIMIT ?",
-                false,
-            )
-        };
+        let mut sql = String::from(
+            "SELECT m.id, m.project_id, m.content, m.memory_type, m.source_session_id,
+                    m.confidence, m.access_count, m.created_at, m.updated_at, m.valid_until
+             FROM memories m",
+        );
+        if !agents.is_empty() {
+            sql.push_str(" JOIN sessions s ON m.source_session_id = s.id");
+        }
+        let mut conditions: Vec<String> = Vec::new();
+        let mut param_values: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
+        if let Some(project) = project {
+            conditions.push("m.project_id ILIKE ?".to_string());
+            param_values.push(Box::new(format!("%{project}%")));
+        }
+        if !agents.is_empty() {
+            conditions.push(format!(
+                "s.agent IN ({})",
+                vec!["?"; agents.len()].join(", ")
+            ));
+            for agent in agents {
+                param_values.push(Box::new(agent.clone()));
+            }
+        }
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+        sql.push_str(" ORDER BY m.updated_at DESC NULLS LAST LIMIT ?");
+        param_values.push(Box::new(limit as i64));
 
+        let params_ref: Vec<&dyn duckdb::ToSql> =
+            param_values.iter().map(|pv| pv.as_ref()).collect();
         let mut stmt = conn
-            .prepare(sql)
-            .context("failed to prepare get_memories")?;
+            .prepare(&sql)
+            .context("failed to prepare get_memories_filtered")?;
 
         let map_row = |row: &duckdb::Row| -> duckdb::Result<Memory> {
             Ok(Memory {
@@ -1729,14 +1807,9 @@ impl DuckStore {
             })
         };
 
-        let rows = if use_project {
-            let pattern = format!("%{}%", project.unwrap());
-            stmt.query_map(params![pattern, limit as i64], map_row)
-                .context("failed to query memories")?
-        } else {
-            stmt.query_map(params![limit as i64], map_row)
-                .context("failed to query memories")?
-        };
+        let rows = stmt
+            .query_map(params_ref.as_slice(), map_row)
+            .context("failed to query memories")?;
 
         let mut memories = Vec::new();
         for row in rows {
@@ -1890,127 +1963,125 @@ impl DuckStore {
         Ok(agents)
     }
 
-    /// Get per-day session counts for the last N days (for sparklines).
-    pub fn get_daily_session_counts(&self, days: i64) -> Result<Vec<i64>> {
+    /// Get per-day session counts for the last N local days (sparklines).
+    pub fn get_daily_session_counts<Tz>(
+        &self,
+        days: i64,
+        now: DateTime<Utc>,
+        tz: &Tz,
+    ) -> Result<Vec<i64>>
+    where
+        Tz: chrono::TimeZone,
+        Tz::Offset: std::fmt::Display,
+    {
         Ok(self
-            .get_daily_counts(days)?
+            .get_daily_counts(days, now, tz)?
             .into_iter()
             .map(|(_, sessions, _, _)| sessions)
             .collect())
     }
 
-    /// Get per-day memory counts for the last N days (for sparklines).
-    pub fn get_daily_memory_counts(&self, days: i64) -> Result<Vec<i64>> {
+    /// Get per-day memory counts for the last N local days (sparklines).
+    pub fn get_daily_memory_counts<Tz>(
+        &self,
+        days: i64,
+        now: DateTime<Utc>,
+        tz: &Tz,
+    ) -> Result<Vec<i64>>
+    where
+        Tz: chrono::TimeZone,
+        Tz::Offset: std::fmt::Display,
+    {
         Ok(self
-            .get_daily_counts(days)?
+            .get_daily_counts(days, now, tz)?
             .into_iter()
             .map(|(_, _, memories, _)| memories)
             .collect())
     }
 
-    /// Get per-day decision counts for the last N days (for sparklines).
-    pub fn get_daily_decision_counts(&self, days: i64) -> Result<Vec<i64>> {
+    /// Get per-day decision counts for the last N local days (sparklines).
+    pub fn get_daily_decision_counts<Tz>(
+        &self,
+        days: i64,
+        now: DateTime<Utc>,
+        tz: &Tz,
+    ) -> Result<Vec<i64>>
+    where
+        Tz: chrono::TimeZone,
+        Tz::Offset: std::fmt::Display,
+    {
         Ok(self
-            .get_daily_counts(days)?
+            .get_daily_counts(days, now, tz)?
             .into_iter()
             .map(|(_, _, _, decisions)| decisions)
             .collect())
     }
 
-    /// Returns (date_str, sessions_count, memories_count, decisions_count) for each of the last N days.
-    pub fn get_daily_counts(&self, days: i64) -> Result<Vec<(String, i64, i64, i64)>> {
+    /// Returns (date_str, sessions_count, memories_count, decisions_count)
+    /// for each of the last `days` calendar days in timezone `tz`, ending
+    /// with the local day containing `now`. Oldest day first.
+    ///
+    /// Buckets are computed on local calendar dates, not UTC dates, so
+    /// sparklines match what the user considers "today".
+    pub fn get_daily_counts<Tz>(
+        &self,
+        days: i64,
+        now: DateTime<Utc>,
+        tz: &Tz,
+    ) -> Result<Vec<(String, i64, i64, i64)>>
+    where
+        Tz: chrono::TimeZone,
+        Tz::Offset: std::fmt::Display,
+    {
         let days = days.max(0);
+        let window = crate::timeutil::day_window_in_tz(now, tz);
+        let cutoff = window.cutoff_days_back(days);
         let conn = self.conn.lock().expect("lock poisoned");
 
-        let now = Utc::now().naive_utc();
-        let today_start = now.date().and_hms_opt(0, 0, 0).context("invalid date")?;
-        let cutoff = today_start - chrono::Duration::days(days);
+        // Query each table separately and merge in Rust, bucketing by the
+        // local calendar date of each timestamp.
+        let sess_map = count_by_local_day(
+            &conn,
+            "SELECT started_at FROM sessions WHERE started_at >= ?",
+            cutoff,
+            tz,
+        )
+        .context("daily session counts")?;
+        let mem_map = count_by_local_day(
+            &conn,
+            "SELECT created_at FROM memories WHERE created_at >= ?",
+            cutoff,
+            tz,
+        )
+        .context("daily memory counts")?;
+        let dec_map = count_by_local_day(
+            &conn,
+            "SELECT created_at FROM decisions WHERE created_at >= ?",
+            cutoff,
+            tz,
+        )
+        .context("daily decision counts")?;
 
-        // Query each table separately and merge in Rust
-        let mut sess_map = std::collections::HashMap::<String, i64>::new();
-        let mut stmt = conn
-            .prepare(
-                "SELECT CAST(started_at AS DATE)::VARCHAR AS day, COUNT(*) AS cnt
-                 FROM sessions
-                 WHERE started_at >= ?
-                 GROUP BY day
-                 ORDER BY day",
-            )
-            .context("failed to prepare daily sessions count")?;
-        let rows = stmt
-            .query_map(params![cutoff], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .context("failed to query daily sessions")?;
-        for row in rows {
-            let (d, c) = row.context("failed to read session count row")?;
-            sess_map.insert(d, c);
-        }
-
-        let mut mem_map = std::collections::HashMap::<String, i64>::new();
-        let mut stmt = conn
-            .prepare(
-                "SELECT CAST(created_at AS DATE)::VARCHAR AS day, COUNT(*) AS cnt
-                 FROM memories
-                 WHERE created_at >= ?
-                 GROUP BY day
-                 ORDER BY day",
-            )
-            .context("failed to prepare daily memories count")?;
-        let rows = stmt
-            .query_map(params![cutoff], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .context("failed to query daily memories")?;
-        for row in rows {
-            let (d, c) = row.context("failed to read memory count row")?;
-            mem_map.insert(d, c);
-        }
-
-        let mut dec_map = std::collections::HashMap::<String, i64>::new();
-        let mut stmt = conn
-            .prepare(
-                "SELECT CAST(created_at AS DATE)::VARCHAR AS day, COUNT(*) AS cnt
-                 FROM decisions
-                 WHERE created_at >= ?
-                 GROUP BY day
-                 ORDER BY day",
-            )
-            .context("failed to prepare daily decisions count")?;
-        let rows = stmt
-            .query_map(params![cutoff], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .context("failed to query daily decisions")?;
-        for row in rows {
-            let (d, c) = row.context("failed to read decision count row")?;
-            dec_map.insert(d, c);
-        }
-
-        // Build ordered result for each day in the range
-        let today = now.date();
+        // Build ordered result for each local day in the range.
+        let today_local = now.with_timezone(tz).date_naive();
         let mut result = Vec::new();
         for i in (0..=days).rev() {
-            let date = today - chrono::Duration::days(i);
+            let date = today_local - chrono::Duration::days(i);
             let date_str = date.format("%Y-%m-%d").to_string();
-            let s = sess_map.get(&date_str).copied().unwrap_or(0);
-            let m = mem_map.get(&date_str).copied().unwrap_or(0);
-            let d = dec_map.get(&date_str).copied().unwrap_or(0);
-            result.push((date_str, s, m, d));
+            let sess = sess_map.get(&date).copied().unwrap_or(0);
+            let mem = mem_map.get(&date).copied().unwrap_or(0);
+            let dec = dec_map.get(&date).copied().unwrap_or(0);
+            result.push((date_str, sess, mem, dec));
         }
 
         Ok(result)
     }
 
-    /// Returns sessions from today and yesterday for briefing comparison.
-    pub fn get_recent_sessions_for_briefing(&self) -> Result<Vec<Session>> {
+    /// Returns sessions since `since` (start of the local yesterday window)
+    /// for briefing comparison.
+    pub fn get_recent_sessions_for_briefing(&self, since: NaiveDateTime) -> Result<Vec<Session>> {
         let conn = self.conn.lock().expect("lock poisoned");
-
-        let now = Utc::now().naive_utc();
-        let cutoff = (now - chrono::Duration::days(1))
-            .date()
-            .and_hms_opt(0, 0, 0)
-            .context("invalid date")?;
+        let cutoff = since;
 
         let mut stmt = conn
             .prepare(
@@ -2051,32 +2122,56 @@ impl DuckStore {
 
     /// Get all decisions, optionally filtered by project.
     pub fn get_decisions(&self, project: Option<&str>, limit: usize) -> Result<Vec<Decision>> {
+        self.get_decisions_filtered(project, &[], limit)
+    }
+
+    /// List decisions with optional project and source-agent filters.
+    ///
+    /// When `agents` is non-empty, only decisions recorded in sessions of
+    /// the listed agents are returned.
+    pub fn get_decisions_filtered(
+        &self,
+        project: Option<&str>,
+        agents: &[String],
+        limit: usize,
+    ) -> Result<Vec<Decision>> {
         let conn = self.conn.lock().expect("lock poisoned");
 
-        let (sql, use_project) = if project.is_some() {
-            (
-                "SELECT id, session_id, project_id, decision_type, what,
-                        why, alternatives, outcome, created_at, valid_until
-                 FROM decisions
-                 WHERE project_id ILIKE ?
-                 ORDER BY created_at DESC NULLS LAST
-                 LIMIT ?",
-                true,
-            )
-        } else {
-            (
-                "SELECT id, session_id, project_id, decision_type, what,
-                        why, alternatives, outcome, created_at, valid_until
-                 FROM decisions
-                 ORDER BY created_at DESC NULLS LAST
-                 LIMIT ?",
-                false,
-            )
-        };
+        let mut sql = String::from(
+            "SELECT d.id, d.session_id, d.project_id, d.decision_type, d.what,
+                    d.why, d.alternatives, d.outcome, d.created_at, d.valid_until
+             FROM decisions d",
+        );
+        if !agents.is_empty() {
+            sql.push_str(" JOIN sessions s ON d.session_id = s.id");
+        }
+        let mut conditions: Vec<String> = Vec::new();
+        let mut param_values: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
+        if let Some(project) = project {
+            conditions.push("d.project_id ILIKE ?".to_string());
+            param_values.push(Box::new(format!("%{project}%")));
+        }
+        if !agents.is_empty() {
+            conditions.push(format!(
+                "s.agent IN ({})",
+                vec!["?"; agents.len()].join(", ")
+            ));
+            for agent in agents {
+                param_values.push(Box::new(agent.clone()));
+            }
+        }
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+        sql.push_str(" ORDER BY d.created_at DESC NULLS LAST LIMIT ?");
+        param_values.push(Box::new(limit as i64));
 
+        let params_ref: Vec<&dyn duckdb::ToSql> =
+            param_values.iter().map(|pv| pv.as_ref()).collect();
         let mut stmt = conn
-            .prepare(sql)
-            .context("failed to prepare get_decisions")?;
+            .prepare(&sql)
+            .context("failed to prepare get_decisions_filtered")?;
 
         let map_row = |row: &duckdb::Row| -> duckdb::Result<Decision> {
             let alts_str: String = row.get::<_, String>(6).unwrap_or_default();
@@ -2094,14 +2189,9 @@ impl DuckStore {
             })
         };
 
-        let rows = if use_project {
-            let pattern = format!("%{}%", project.unwrap());
-            stmt.query_map(params![pattern, limit as i64], map_row)
-                .context("failed to query decisions")?
-        } else {
-            stmt.query_map(params![limit as i64], map_row)
-                .context("failed to query decisions")?
-        };
+        let rows = stmt
+            .query_map(params_ref.as_slice(), map_row)
+            .context("failed to query decisions")?;
 
         let mut decisions = Vec::new();
         for row in rows {
@@ -3337,34 +3427,55 @@ impl DuckStore {
 
     /// Get all facts (active + invalidated), optionally filtered by project.
     pub fn get_all_facts(&self, project: Option<&str>, limit: usize) -> Result<Vec<Fact>> {
+        self.get_all_facts_filtered(project, &[], limit)
+    }
+
+    /// Get all facts (active and superseded) with optional project and
+    /// source-agent filters.
+    pub fn get_all_facts_filtered(
+        &self,
+        project: Option<&str>,
+        agents: &[String],
+        limit: usize,
+    ) -> Result<Vec<Fact>> {
         let conn = self.conn.lock().expect("lock poisoned");
 
-        let (sql, use_project) = if project.is_some() {
-            (
-                "SELECT id, project_id, subject, predicate, object, confidence,
-                        source_session_id, source_agent, valid_at, invalid_at,
-                        superseded_by, created_at
-                 FROM facts
-                 WHERE project_id ILIKE ?
-                 ORDER BY created_at DESC NULLS LAST
-                 LIMIT ?",
-                true,
-            )
+        let mut conditions: Vec<String> = Vec::new();
+        let mut param_values: Vec<Box<dyn duckdb::ToSql>> = Vec::new();
+        if let Some(project) = project {
+            conditions.push("project_id ILIKE ?".to_string());
+            param_values.push(Box::new(format!("%{project}%")));
+        }
+        if !agents.is_empty() {
+            conditions.push(format!(
+                "source_agent IN ({})",
+                vec!["?"; agents.len()].join(", ")
+            ));
+            for agent in agents {
+                param_values.push(Box::new(agent.clone()));
+            }
+        }
+        let where_clause = if conditions.is_empty() {
+            String::new()
         } else {
-            (
-                "SELECT id, project_id, subject, predicate, object, confidence,
-                        source_session_id, source_agent, valid_at, invalid_at,
-                        superseded_by, created_at
-                 FROM facts
-                 ORDER BY created_at DESC NULLS LAST
-                 LIMIT ?",
-                false,
-            )
+            format!("WHERE {}", conditions.join(" AND "))
         };
+        let sql = format!(
+            "SELECT id, project_id, subject, predicate, object, confidence,
+                    source_session_id, source_agent, valid_at, invalid_at,
+                    superseded_by, created_at
+             FROM facts
+             {where_clause}
+             ORDER BY created_at DESC NULLS LAST
+             LIMIT ?"
+        );
+        param_values.push(Box::new(limit as i64));
 
+        let params_ref: Vec<&dyn duckdb::ToSql> =
+            param_values.iter().map(|pv| pv.as_ref()).collect();
         let mut stmt = conn
-            .prepare(sql)
-            .context("failed to prepare get_all_facts")?;
+            .prepare(&sql)
+            .context("failed to prepare get_all_facts_filtered")?;
 
         let map_row = |row: &duckdb::Row| -> duckdb::Result<Fact> {
             Ok(Fact {
@@ -3383,14 +3494,9 @@ impl DuckStore {
             })
         };
 
-        let rows = if use_project {
-            let pattern = format!("%{}%", project.unwrap());
-            stmt.query_map(params![pattern, limit as i64], map_row)
-                .context("failed to query all facts")?
-        } else {
-            stmt.query_map(params![limit as i64], map_row)
-                .context("failed to query all facts")?
-        };
+        let rows = stmt
+            .query_map(params_ref.as_slice(), map_row)
+            .context("failed to query all facts")?;
 
         let mut facts = Vec::new();
         for row in rows {
@@ -3437,9 +3543,10 @@ impl DuckStore {
     // -----------------------------------------------------------------------
 
     /// Per-project breakdown for the current UTC day.
-    pub fn get_project_breakdown_today(&self) -> Result<Vec<serde_json::Value>> {
-        let now = Utc::now().naive_utc();
-        let since = now.date().and_hms_opt(0, 0, 0).context("invalid date")?;
+    pub fn get_project_breakdown_today(
+        &self,
+        since: NaiveDateTime,
+    ) -> Result<Vec<serde_json::Value>> {
         let sessions = self.search_sessions(None, None, Some(since), 10_000)?;
 
         let mut by_project: std::collections::HashMap<
@@ -3486,11 +3593,9 @@ impl DuckStore {
         Ok(result)
     }
 
-    /// Decisions created during the current UTC day.
-    pub fn get_decisions_today(&self) -> Result<Vec<serde_json::Value>> {
+    /// Decisions created during the current local day (window starts at `since`).
+    pub fn get_decisions_today(&self, since: NaiveDateTime) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().expect("lock poisoned");
-        let now = Utc::now().naive_utc();
-        let since = now.date().and_hms_opt(0, 0, 0).context("invalid date")?;
 
         let mut stmt = conn
             .prepare(
@@ -3521,11 +3626,10 @@ impl DuckStore {
         Ok(result)
     }
 
-    /// Facts created or becoming valid during the current UTC day.
-    pub fn get_new_facts_today(&self) -> Result<Vec<serde_json::Value>> {
+    /// Facts created or becoming valid during the current local day (window
+    /// starts at `since`).
+    pub fn get_new_facts_today(&self, since: NaiveDateTime) -> Result<Vec<serde_json::Value>> {
         let conn = self.conn.lock().expect("lock poisoned");
-        let now = Utc::now().naive_utc();
-        let since = now.date().and_hms_opt(0, 0, 0).context("invalid date")?;
 
         let mut stmt = conn
             .prepare(
@@ -3558,10 +3662,13 @@ impl DuckStore {
         Ok(result)
     }
 
-    /// Top files changed today, aggregated from session `files_changed` arrays.
-    pub fn get_top_files_today(&self, limit: usize) -> Result<Vec<(String, i64)>> {
-        let now = Utc::now().naive_utc();
-        let since = now.date().and_hms_opt(0, 0, 0).context("invalid date")?;
+    /// Top files changed during the current local day (window starts at
+    /// `since`), aggregated from session `files_changed` arrays.
+    pub fn get_top_files_today(
+        &self,
+        since: NaiveDateTime,
+        limit: usize,
+    ) -> Result<Vec<(String, i64)>> {
         let sessions = self.search_sessions(None, None, Some(since), 10_000)?;
 
         let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
@@ -3572,15 +3679,16 @@ impl DuckStore {
         }
 
         let mut pairs: Vec<(String, i64)> = counts.into_iter().collect();
-        pairs.sort_by(|a, b| b.1.cmp(&a.1));
+        pairs.sort_by_key(|p| std::cmp::Reverse(p.1));
         pairs.truncate(limit);
         Ok(pairs)
     }
 
-    /// Session summaries from the last 24 hours.
-    pub fn get_session_summaries_today(&self) -> Result<Vec<serde_json::Value>> {
-        let now = Utc::now().naive_utc();
-        let since = now.date().and_hms_opt(0, 0, 0).context("invalid date")?;
+    /// Session summaries from the current local day (window starts at `since`).
+    pub fn get_session_summaries_today(
+        &self,
+        since: NaiveDateTime,
+    ) -> Result<Vec<serde_json::Value>> {
         let sessions = self.search_sessions(None, None, Some(since), 10_000)?;
 
         let result: Vec<serde_json::Value> = sessions
@@ -3737,10 +3845,18 @@ impl DuckStore {
             }
         }
 
-        // 4. Cross-agent conflicts — different agents, same project+type, different content
+        // 4. Cross-agent conflicts — different agents, same project+type,
+        //    different content, AND topically overlapping.
+        //
+        //    Content inequality alone flags every unrelated memory pair as a
+        //    "conflict" (issue #26), so candidates must additionally share at
+        //    least MIN_SHARED_TOKENS significant tokens. Survivors are ranked
+        //    by overlap size, then recency, rather than arbitrary id order.
+        const MIN_SHARED_TOKENS: usize = 2;
+        const CANDIDATE_LIMIT: i64 = 500;
         {
             let result: Result<(), anyhow::Error> = (|| {
-                let mut stmt = conn.prepare(
+                let mut stmt = conn.prepare(&format!(
                     "SELECT m1.id, m2.id, m1.project_id, m1.memory_type,
                             s1.agent, s2.agent, m1.content, m2.content, m1.created_at
                      FROM memories m1
@@ -3754,8 +3870,8 @@ impl DuckStore {
                      WHERE s1.agent <> s2.agent
                        AND m1.created_at >= ?
                        AND m2.created_at >= ?
-                     LIMIT 10",
-                )?;
+                     LIMIT {CANDIDATE_LIMIT}",
+                ))?;
                 let rows = stmt.query_map(params![conflict_cutoff, conflict_cutoff], |row| {
                     let id1: String = row.get(0)?;
                     let id2: String = row.get(1)?;
@@ -3778,6 +3894,20 @@ impl DuckStore {
                         created_at,
                     ))
                 })?;
+                struct ConflictCandidate {
+                    overlap: usize,
+                    id1: String,
+                    id2: String,
+                    project_id: Option<String>,
+                    memory_type: Option<String>,
+                    agent1: String,
+                    agent2: String,
+                    content1: String,
+                    content2: String,
+                    created_at: Option<NaiveDateTime>,
+                }
+
+                let mut candidates: Vec<ConflictCandidate> = Vec::new();
                 for row in rows {
                     let (
                         id1,
@@ -3790,6 +3920,43 @@ impl DuckStore {
                         content2,
                         created_at,
                     ) = row?;
+                    let tokens1 = significant_tokens(&content1);
+                    let overlap = significant_tokens(&content2).intersection(&tokens1).count();
+                    if overlap < MIN_SHARED_TOKENS {
+                        continue;
+                    }
+                    candidates.push(ConflictCandidate {
+                        overlap,
+                        id1,
+                        id2,
+                        project_id,
+                        memory_type,
+                        agent1,
+                        agent2,
+                        content1,
+                        content2,
+                        created_at,
+                    });
+                }
+                // Strongest topical overlap first; newest pairs break ties.
+                candidates.sort_by(|a, b| {
+                    b.overlap
+                        .cmp(&a.overlap)
+                        .then_with(|| b.created_at.cmp(&a.created_at))
+                });
+                for ConflictCandidate {
+                    overlap,
+                    id1,
+                    id2,
+                    project_id,
+                    memory_type,
+                    agent1,
+                    agent2,
+                    content1,
+                    content2,
+                    created_at,
+                } in candidates.into_iter().take(10)
+                {
                     let proj = project_id.as_deref().unwrap_or("unknown");
                     let mtype = memory_type.as_deref().unwrap_or("unknown");
                     let snip1: String = content1.chars().take(80).collect();
@@ -3803,6 +3970,7 @@ impl DuckStore {
                         "title": format!("Cross-agent conflict in {proj} ({mtype})"),
                         "detail": format!("{agent1}: \"{snip1}...\" vs {agent2}: \"{snip2}...\""),
                         "entity_ids": [id1, id2],
+                        "shared_terms": overlap,
                         "created_at": ts,
                     }));
                 }
@@ -4125,7 +4293,7 @@ mod tests {
     }
 
     #[test]
-    fn test_daily_and_today_analytics_use_utc_day_boundaries() {
+    fn test_daily_and_today_analytics_use_provided_day_boundaries() {
         let store = DuckStore::open_in_memory().unwrap();
         let now = Utc::now().naive_utc();
         let today_start = now.date().and_hms_opt(0, 0, 0).unwrap();
@@ -4159,12 +4327,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(store.count_sessions_since(today_start).unwrap(), 1);
-        let todays_sessions = store.get_todays_sessions().unwrap();
+        let todays_sessions = store.get_todays_sessions(today_start).unwrap();
         assert_eq!(todays_sessions.len(), 1);
         assert_eq!(todays_sessions[0].id, "analytics-today");
+        let now_dt = now.and_utc();
         assert_eq!(
             store
-                .get_daily_session_counts(0)
+                .get_daily_session_counts(0, now_dt, &Utc)
                 .unwrap()
                 .last()
                 .copied()
@@ -4173,7 +4342,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .get_daily_memory_counts(0)
+                .get_daily_memory_counts(0, now_dt, &Utc)
                 .unwrap()
                 .last()
                 .copied()
@@ -4182,7 +4351,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .get_daily_decision_counts(0)
+                .get_daily_decision_counts(0, now_dt, &Utc)
                 .unwrap()
                 .last()
                 .copied()
@@ -4190,12 +4359,12 @@ mod tests {
             1
         );
 
-        let daily = store.get_daily_counts(0).unwrap();
+        let daily = store.get_daily_counts(0, now_dt, &Utc).unwrap();
         assert_eq!(daily.len(), 1);
         assert_eq!(daily[0].0, now.date().to_string());
         assert_eq!(daily[0].1, 1);
 
-        let projects = store.get_project_breakdown_today().unwrap();
+        let projects = store.get_project_breakdown_today(today_start).unwrap();
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0]["sessions"].as_u64(), Some(1));
         assert_eq!(
@@ -4203,14 +4372,14 @@ mod tests {
             Some("src/today.rs")
         );
 
-        let top_files = store.get_top_files_today(10).unwrap();
+        let top_files = store.get_top_files_today(today_start, 10).unwrap();
         assert_eq!(top_files, vec![("src/today.rs".into(), 1)]);
 
-        let decisions = store.get_decisions_today().unwrap();
+        let decisions = store.get_decisions_today(today_start).unwrap();
         assert_eq!(decisions.len(), 1);
         assert_eq!(decisions[0]["what"].as_str(), Some("use UTC boundaries"));
 
-        let summaries = store.get_session_summaries_today().unwrap();
+        let summaries = store.get_session_summaries_today(today_start).unwrap();
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0]["summary"].as_str(), Some("refactored module"));
     }
@@ -4294,6 +4463,303 @@ mod tests {
             .find(|item| item["type"] == "high_churn")
             .unwrap();
         assert_eq!(churn["entity_ids"][0].as_str(), Some("src/hot.rs"));
+    }
+
+    /// Build a session for a specific agent with a fixed start time.
+    fn make_session_for(id: &str, agent: &str, started_at: NaiveDateTime) -> Session {
+        Session {
+            id: id.to_string(),
+            project_id: Some("proj-1".into()),
+            agent: agent.into(),
+            started_at: Some(started_at),
+            ended_at: None,
+            duration_minutes: Some(10),
+            message_count: Some(5),
+            tool_call_count: Some(3),
+            total_tokens: Some(1200),
+            files_changed: vec![],
+            summary: None,
+        }
+    }
+
+    /// Build a memory attached to a source session.
+    fn make_memory_from(id: &str, content: &str, session_id: &str) -> Memory {
+        Memory {
+            id: id.to_string(),
+            project_id: Some("proj-1".into()),
+            content: content.into(),
+            memory_type: Some("insight".into()),
+            source_session_id: Some(session_id.into()),
+            confidence: 0.9,
+            access_count: 0,
+            created_at: Some(Utc::now().naive_utc()),
+            updated_at: Some(Utc::now().naive_utc()),
+            valid_until: None,
+        }
+    }
+
+    #[test]
+    fn test_significant_tokens_filters_stop_words_and_short_tokens() {
+        let tokens = significant_tokens("The JWT auth middleware uses a for x!");
+        assert!(tokens.contains("jwt"));
+        assert!(tokens.contains("auth"));
+        assert!(tokens.contains("middleware"));
+        assert!(!tokens.contains("the"), "stop words must be dropped");
+        assert!(!tokens.contains("a"), "short tokens must be dropped");
+        assert!(!tokens.contains("x"), "short tokens must be dropped");
+    }
+
+    #[test]
+    fn test_attention_conflict_requires_topical_overlap() {
+        let store = DuckStore::open_in_memory().unwrap();
+        let now = Utc::now().naive_utc();
+        store
+            .insert_session(&make_session_for("s-claude", "claude_code", now))
+            .unwrap();
+        store
+            .insert_session(&make_session_for("s-codex", "codex", now))
+            .unwrap();
+
+        // Unrelated pair: different agents, same project/type, different
+        // content — but no topical overlap. Must NOT be flagged (issue #26).
+        store
+            .insert_memory(&make_memory_from(
+                "m-unrelated-1",
+                "Prefer tower middleware for routing layers",
+                "s-claude",
+            ))
+            .unwrap();
+        store
+            .insert_memory(&make_memory_from(
+                "m-unrelated-2",
+                "Database migrations run during deploy",
+                "s-codex",
+            ))
+            .unwrap();
+
+        // Topically overlapping pair: both discuss JWT auth tokens.
+        store
+            .insert_memory(&make_memory_from(
+                "m-jwt-1",
+                "JWT auth tokens expire after one hour",
+                "s-claude",
+            ))
+            .unwrap();
+        store
+            .insert_memory(&make_memory_from(
+                "m-jwt-2",
+                "JWT auth tokens should never expire",
+                "s-codex",
+            ))
+            .unwrap();
+
+        let items = store.get_attention_items().unwrap();
+        let conflicts: Vec<_> = items
+            .iter()
+            .filter(|item| item["type"] == "conflict")
+            .collect();
+
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "only the topically overlapping pair may be flagged: {conflicts:?}"
+        );
+        let ids: Vec<&str> = conflicts[0]["entity_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"m-jwt-1") && ids.contains(&"m-jwt-2"));
+        assert!(
+            conflicts[0]["shared_terms"].as_u64().unwrap_or(0) >= 2,
+            "shared_terms should be reported"
+        );
+    }
+
+    #[test]
+    fn test_filtered_listings_by_agent() {
+        let store = DuckStore::open_in_memory().unwrap();
+        let now = Utc::now().naive_utc();
+        store
+            .insert_session(&make_session_for("s-claude", "claude_code", now))
+            .unwrap();
+        store
+            .insert_session(&make_session_for("s-codex", "codex", now))
+            .unwrap();
+
+        store
+            .insert_memory(&make_memory_from("m-c", "claude memory", "s-claude"))
+            .unwrap();
+        store
+            .insert_memory(&make_memory_from("m-x", "codex memory", "s-codex"))
+            .unwrap();
+        // Manual note without a source session.
+        store
+            .insert_memory(&make_memory("m-note", "manual note"))
+            .unwrap();
+
+        // Memories: agent filter narrows to the agent's own rows and drops
+        // manual notes; empty filter returns everything.
+        let codex_only = store
+            .get_memories_filtered(None, &["codex".to_string()], 100)
+            .unwrap();
+        assert_eq!(codex_only.len(), 1);
+        assert_eq!(codex_only[0].id, "m-x");
+        let all = store.get_memories_filtered(None, &[], 100).unwrap();
+        assert_eq!(all.len(), 3);
+        let both = store
+            .get_memories_filtered(None, &["codex".to_string(), "claude_code".to_string()], 100)
+            .unwrap();
+        assert_eq!(both.len(), 2);
+
+        // Facts: filtered directly on source_agent.
+        let mut fact_c = make_fact("f-c", "build", "uses", "cargo");
+        fact_c.source_agent = Some("claude_code".into());
+        let mut fact_x = make_fact("f-x", "build", "uses", "bazel");
+        fact_x.source_agent = Some("codex".into());
+        store.insert_fact(&fact_c).unwrap();
+        store.insert_fact(&fact_x).unwrap();
+        let facts_x = store
+            .get_active_facts_filtered(None, &["codex".to_string()], 100)
+            .unwrap();
+        assert_eq!(facts_x.len(), 1);
+        assert_eq!(facts_x[0].id, "f-x");
+        let all_facts = store
+            .get_all_facts_filtered(None, &["claude_code".to_string()], 100)
+            .unwrap();
+        assert_eq!(all_facts.len(), 1);
+        assert_eq!(all_facts[0].id, "f-c");
+
+        // Decisions: filtered through the owning session's agent.
+        store
+            .insert_decision(&Decision {
+                id: "d-c".into(),
+                session_id: Some("s-claude".into()),
+                project_id: Some("proj-1".into()),
+                decision_type: None,
+                what: "use tower".into(),
+                why: None,
+                alternatives: vec![],
+                outcome: None,
+                created_at: Some(now),
+                valid_until: None,
+            })
+            .unwrap();
+        store
+            .insert_decision(&Decision {
+                id: "d-x".into(),
+                session_id: Some("s-codex".into()),
+                project_id: Some("proj-1".into()),
+                decision_type: None,
+                what: "use axum".into(),
+                why: None,
+                alternatives: vec![],
+                outcome: None,
+                created_at: Some(now),
+                valid_until: None,
+            })
+            .unwrap();
+        let decisions_x = store
+            .get_decisions_filtered(None, &["codex".to_string()], 100)
+            .unwrap();
+        assert_eq!(decisions_x.len(), 1);
+        assert_eq!(decisions_x[0].id, "d-x");
+        let decisions_all = store.get_decisions_filtered(None, &[], 100).unwrap();
+        assert_eq!(decisions_all.len(), 2);
+    }
+
+    #[test]
+    fn test_daily_counts_bucket_by_local_day() {
+        use chrono::FixedOffset;
+
+        let store = DuckStore::open_in_memory().unwrap();
+        // 2026-08-23 02:00 UTC == 2026-08-22 22:00 in UTC-4.
+        let ts = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_hms_opt(2, 0, 0)
+            .unwrap();
+        store
+            .insert_session(&make_session_for("s-late", "codex", ts))
+            .unwrap();
+
+        // "Now" is 2026-08-23 03:00 UTC (still the evening of Aug 22 in UTC-4).
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_hms_opt(3, 0, 0)
+            .unwrap()
+            .and_utc();
+        let tz_west = FixedOffset::west_opt(4 * 3600).unwrap();
+
+        let rows = store.get_daily_counts(1, now, &tz_west).unwrap();
+        assert_eq!(rows.len(), 2);
+        // Local days: Aug 21 (empty) and Aug 22 (the session).
+        assert_eq!(rows[0].0, "2026-08-21");
+        assert_eq!(rows[0].1, 0);
+        assert_eq!(rows[1].0, "2026-08-22");
+        assert_eq!(rows[1].1, 1, "session must bucket into the LOCAL day");
+
+        // Same data viewed in UTC buckets lands on Aug 23.
+        let rows_utc = store.get_daily_counts(1, now, &Utc).unwrap();
+        assert_eq!(rows_utc.last().unwrap().0, "2026-08-23");
+        assert_eq!(rows_utc.last().unwrap().1, 1);
+
+        // Wrapper helpers agree with the raw rows.
+        let sess = store.get_daily_session_counts(1, now, &tz_west).unwrap();
+        assert_eq!(sess, vec![0, 1]);
+        let mem = store.get_daily_memory_counts(1, now, &tz_west).unwrap();
+        assert_eq!(mem, vec![0, 0]);
+        let dec = store.get_daily_decision_counts(1, now, &tz_west).unwrap();
+        assert_eq!(dec, vec![0, 0]);
+    }
+
+    #[test]
+    fn test_today_queries_respect_provided_window() {
+        let store = DuckStore::open_in_memory().unwrap();
+        let now = Utc::now().naive_utc();
+        let today = now - chrono::Duration::hours(1);
+        let two_days_ago = now - chrono::Duration::days(2);
+
+        store
+            .insert_session(&make_session_for("s-today", "codex", today))
+            .unwrap();
+        store
+            .insert_session(&make_session_for("s-old", "codex", two_days_ago))
+            .unwrap();
+        store
+            .insert_decision(&Decision {
+                id: "d-today".into(),
+                session_id: Some("s-today".into()),
+                project_id: Some("proj-1".into()),
+                decision_type: None,
+                what: "ship it".into(),
+                why: None,
+                alternatives: vec![],
+                outcome: None,
+                created_at: Some(today),
+                valid_until: None,
+            })
+            .unwrap();
+
+        // A window starting "now minus 1 day" includes today's rows only.
+        let since = now - chrono::Duration::days(1);
+        let decisions = store.get_decisions_today(since).unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0]["what"], "ship it");
+        let summaries = store.get_session_summaries_today(since).unwrap();
+        // s-today has no summary; ensure no panic and correct filtering.
+        assert!(summaries.is_empty());
+        let top_files = store.get_top_files_today(since, 10).unwrap();
+        assert!(top_files.is_empty());
+        let breakdown = store.get_project_breakdown_today(since).unwrap();
+        assert_eq!(breakdown.len(), 1);
+        assert_eq!(breakdown[0]["sessions"], 1);
+
+        // Briefing window reaches back over both sessions.
+        let recent = store
+            .get_recent_sessions_for_briefing(now - chrono::Duration::days(3))
+            .unwrap();
+        assert_eq!(recent.len(), 2);
     }
 
     // -------------------------------------------------------------------

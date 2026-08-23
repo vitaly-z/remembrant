@@ -576,8 +576,17 @@ impl CodexIngester {
 /// - `2026-03-05T05:00:04.837Z`
 /// - `2026-03-05T05:00:04.618Z`
 /// - `2026-03-05T05:00:04Z`
+/// - `2026-03-05T05:00:04.837+02:00` (numeric offsets, normalized to UTC)
+/// - `2026-03-05T05:00:04` (naive, assumed UTC)
 fn parse_iso_timestamp(s: &str) -> Option<NaiveDateTime> {
-    // Strip trailing 'Z' and try parsing.
+    // RFC 3339 / ISO 8601 with an explicit numeric offset or `Z`. Normalize to
+    // UTC so timestamps from any zone land on the same naive-UTC timeline as
+    // the rest of the ingested data.
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Some(dt.naive_utc());
+    }
+
+    // Naive timestamps (no zone designator) are treated as UTC.
     let s = s.trim_end_matches('Z');
 
     // Try with fractional seconds.
@@ -816,6 +825,38 @@ mod tests {
 
         let ts3 = parse_iso_timestamp("not a timestamp");
         assert!(ts3.is_none());
+    }
+
+    #[test]
+    fn test_parse_iso_timestamp_numeric_offsets_normalize_to_utc() {
+        // +02:00 offset: 07:00 local is 05:00 UTC.
+        let dt = parse_iso_timestamp("2026-03-05T07:00:04.837+02:00")
+            .expect("+02:00 offset timestamp must parse");
+        assert_eq!(
+            dt.date(),
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 5).unwrap()
+        );
+        assert_eq!(dt.time().hour(), 5);
+        assert_eq!(dt.time().minute(), 0);
+
+        // -05:00 offset crosses the UTC date boundary forward.
+        let dt = parse_iso_timestamp("2026-03-04T23:30:00-05:00")
+            .expect("-05:00 offset timestamp must parse");
+        assert_eq!(
+            dt.date(),
+            chrono::NaiveDate::from_ymd_opt(2026, 3, 5).unwrap()
+        );
+        assert_eq!(dt.time().hour(), 4);
+        assert_eq!(dt.time().minute(), 30);
+
+        // Offset without fractional seconds.
+        let dt = parse_iso_timestamp("2026-03-05T05:00:04+00:00")
+            .expect("+00:00 offset timestamp must parse");
+        assert_eq!(dt.time().hour(), 5);
+
+        // Naive timestamp (no zone designator) is treated as UTC, unchanged.
+        let dt = parse_iso_timestamp("2026-03-05T05:00:04").expect("naive timestamp must parse");
+        assert_eq!(dt.time().hour(), 5);
     }
 
     #[test]

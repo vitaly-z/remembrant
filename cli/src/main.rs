@@ -10,7 +10,7 @@ use axum::{
     http::StatusCode,
     routing::{delete, get, post},
 };
-use chrono::{Datelike, NaiveDateTime};
+use chrono::NaiveDateTime;
 use clap::{Parser, Subcommand};
 mod mcp_server;
 
@@ -255,16 +255,6 @@ enum Commands {
 
     /// Garbage collect old/orphaned data
     Gc,
-
-    /// Deep code analysis using Infiniloom AST parsing
-    Analyze {
-        /// Repository path to analyze
-        path: String,
-
-        /// Project ID (default: directory name)
-        #[arg(long)]
-        project: Option<String>,
-    },
 
     /// Launch web dashboard on localhost
     Web {
@@ -1424,7 +1414,7 @@ fn cmd_brief(project: Option<&str>, today: bool, json_output: bool) -> Result<()
         println!("  (none)");
     } else {
         let mut sorted: Vec<_> = project_counts.iter().collect();
-        sorted.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+        sorted.sort_by_key(|item| std::cmp::Reverse(item.1.0));
         for (proj, (count, _, _)) in &sorted {
             let label = if *count == 1 { "session" } else { "sessions" };
             println!("  - {proj} ({count} {label})");
@@ -1694,7 +1684,7 @@ fn cmd_patterns(topic: Option<&str>) -> Result<()> {
 
     // Sort by number of projects (descending)
     let mut sorted: Vec<_> = pattern_groups.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.0.len().cmp(&a.1.0.len()));
+    sorted.sort_by_key(|item| std::cmp::Reverse(item.1.0.len()));
 
     println!("Cross-Project Patterns:\n");
     for (content, (projects, first_seen)) in &sorted {
@@ -2262,50 +2252,6 @@ fn build_graph(store: &DuckStore) -> Result<GraphBuilder<&DuckStore>> {
     Ok(builder)
 }
 
-fn cmd_analyze(_path: &str, _project: Option<&str>) -> Result<()> {
-    #[cfg(not(feature = "code-analysis"))]
-    {
-        anyhow::bail!(
-            "Code analysis requires the 'code-analysis' feature.\n\
-             Rebuild with: cargo build --features code-analysis"
-        );
-    }
-
-    #[cfg(feature = "code-analysis")]
-    {
-        use remembrant_engine::code_analysis::CodeAnalyzer;
-
-        let config = AppConfig::load()?;
-        let store = open_store(&config)?;
-        let repo_path = expand_tilde(_path);
-
-        let project_id = _project.map(String::from).unwrap_or_else(|| {
-            repo_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string()
-        });
-
-        println!("Analyzing {}...", repo_path.display());
-        println!("  Project: {project_id}");
-
-        let analyzer = CodeAnalyzer::new(&project_id, &repo_path);
-
-        // Persist code graph relationships in DuckDB alongside the symbol rows.
-        let graph = GraphBuilder::with_backend(&store);
-        let result = analyzer.analyze(&store, graph.backend())?;
-
-        println!("\nAnalysis complete:");
-        println!("  Files analyzed:    {}", result.files_analyzed);
-        println!("  Symbols extracted: {}", result.symbols_extracted);
-        println!("  Dependencies:      {}", result.dependencies_found);
-        println!("  Duration:          {}ms", result.duration_ms);
-
-        Ok(())
-    }
-}
-
 async fn cmd_embed(path: &str, update: bool) -> Result<()> {
     let config = AppConfig::load()?;
     let abs_path =
@@ -2478,6 +2424,20 @@ fn api_limit(requested: Option<usize>, default: usize, maximum: usize) -> usize 
     requested.unwrap_or(default).clamp(1, maximum)
 }
 
+/// Parse a comma-separated `agent=` filter value (e.g. `codex,gemini`)
+/// into a clean list, dropping empty segments and surrounding whitespace.
+fn parse_agent_filter(raw: Option<String>) -> Vec<String> {
+    raw.map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|agent| !agent.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
 async fn web_index() -> impl axum::response::IntoResponse {
     (
         [
@@ -2495,6 +2455,19 @@ async fn web_dashboard_css() -> impl axum::response::IntoResponse {
             (axum::http::header::CACHE_CONTROL, "no-cache"),
         ],
         include_str!("web_dashboard.css"),
+    )
+}
+
+async fn web_dashboard_util_js() -> impl axum::response::IntoResponse {
+    (
+        [
+            (
+                axum::http::header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        include_str!("web_dashboard_util.js"),
     )
 }
 
@@ -2636,6 +2609,8 @@ struct MemoriesQuery {
     project: Option<String>,
     tag: Option<String>,
     limit: Option<usize>,
+    /// Comma-separated: `?agent=codex,gemini`.
+    agent: Option<String>,
 }
 
 async fn web_memories(
@@ -2644,6 +2619,7 @@ async fn web_memories(
 ) -> Result<axum::Json<serde_json::Value>, StatusCode> {
     let store = state.store()?;
     let limit = api_limit(q.limit, 200, 1_000);
+    let agents = parse_agent_filter(q.agent);
     let memories = if let Some(tag) = q.tag.as_deref() {
         store
             .search_memories_by_tag(tag, limit)
@@ -2657,7 +2633,7 @@ async fn web_memories(
             .collect::<Vec<_>>()
     } else {
         store
-            .get_memories(q.project.as_deref(), limit)
+            .get_memories_filtered(q.project.as_deref(), &agents, limit)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     };
     let mut values = serde_json::to_value(&memories)
@@ -2678,6 +2654,8 @@ async fn web_memories(
 #[derive(serde::Deserialize)]
 struct DecisionsQuery {
     project: Option<String>,
+    /// Comma-separated: `?agent=codex,gemini`.
+    agent: Option<String>,
 }
 
 async fn web_decisions(
@@ -2685,8 +2663,9 @@ async fn web_decisions(
     Query(q): Query<DecisionsQuery>,
 ) -> Result<axum::Json<serde_json::Value>, StatusCode> {
     let store = state.store()?;
+    let agents = parse_agent_filter(q.agent);
     let decisions = store
-        .get_decisions(q.project.as_deref(), 100)
+        .get_decisions_filtered(q.project.as_deref(), &agents, 100)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(axum::Json(
         serde_json::to_value(&decisions).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
@@ -2733,6 +2712,8 @@ struct FactsQuery {
     project: Option<String>,
     active_only: Option<bool>,
     limit: Option<usize>,
+    /// Comma-separated: `?agent=codex,gemini`.
+    agent: Option<String>,
 }
 
 async fn web_facts(
@@ -2742,13 +2723,14 @@ async fn web_facts(
     let store = state.store()?;
     let limit = api_limit(q.limit, 100, 10_000);
     let active_only = q.active_only.unwrap_or(true);
+    let agents = parse_agent_filter(q.agent);
     let facts = if active_only {
         store
-            .get_active_facts(q.project.as_deref(), limit)
+            .get_active_facts_filtered(q.project.as_deref(), &agents, limit)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     } else {
         store
-            .get_all_facts(q.project.as_deref(), limit)
+            .get_all_facts_filtered(q.project.as_deref(), &agents, limit)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
     };
     Ok(axum::Json(
@@ -3144,12 +3126,14 @@ async fn web_briefing(
 ) -> Result<axum::Json<serde_json::Value>, StatusCode> {
     let store = state.store()?;
     let map_store_error = |_| StatusCode::INTERNAL_SERVER_ERROR;
-    let now = chrono::Utc::now().naive_utc();
-    let today_start = now.date().and_hms_opt(0, 0, 0).unwrap_or(now);
-    let yesterday_start = (now - chrono::Duration::days(1))
-        .date()
-        .and_hms_opt(0, 0, 0)
-        .unwrap_or(now);
+    let now = chrono::Utc::now();
+    // "Today" and "yesterday" are the user's LOCAL calendar days, expressed
+    // as naive-UTC windows (issue #25). Computing them from UTC midnight
+    // misattributes activity for every user not at UTC+0.
+    let day = remembrant_engine::timeutil::local_day_window(now);
+    let today_start = day.start;
+    let yesterday_start = day.shifted_back(1).start;
+    let tz_offset = chrono::Local::now().format("%:z").to_string();
 
     // Current (today) counts
     let cur_sessions = store
@@ -3162,7 +3146,7 @@ async fn web_briefing(
         .count_decisions_since(today_start)
         .map_err(map_store_error)?;
     let recent_sessions = store
-        .get_recent_sessions_for_briefing()
+        .get_recent_sessions_for_briefing(yesterday_start)
         .map_err(map_store_error)?;
     let cur_tokens: i64 = recent_sessions
         .iter()
@@ -3238,27 +3222,35 @@ async fn web_briefing(
         trend_word,
     );
 
-    // Sparklines (last 7 days)
-    let spark_sessions = store.get_daily_session_counts(6).map_err(map_store_error)?;
-    let spark_memories = store.get_daily_memory_counts(6).map_err(map_store_error)?;
+    // Sparklines (last 7 local days)
+    let spark_sessions = store
+        .get_daily_session_counts(6, now, &chrono::Local)
+        .map_err(map_store_error)?;
+    let spark_memories = store
+        .get_daily_memory_counts(6, now, &chrono::Local)
+        .map_err(map_store_error)?;
     let spark_decisions = store
-        .get_daily_decision_counts(6)
+        .get_daily_decision_counts(6, now, &chrono::Local)
         .map_err(map_store_error)?;
 
     // Project breakdown
     let project_breakdown: Vec<serde_json::Value> = store
-        .get_project_breakdown_today()
+        .get_project_breakdown_today(today_start)
         .map_err(map_store_error)?;
 
     // Decisions today
-    let decisions_today = store.get_decisions_today().map_err(map_store_error)?;
+    let decisions_today = store
+        .get_decisions_today(today_start)
+        .map_err(map_store_error)?;
 
     // New facts
-    let new_facts = store.get_new_facts_today().map_err(map_store_error)?;
+    let new_facts = store
+        .get_new_facts_today(today_start)
+        .map_err(map_store_error)?;
 
     // Top files
     let top_files: Vec<serde_json::Value> = store
-        .get_top_files_today(10)
+        .get_top_files_today(today_start, 10)
         .map_err(map_store_error)?
         .into_iter()
         .map(|(path, changes)| serde_json::json!({"file_path": path, "change_frequency": changes}))
@@ -3266,15 +3258,13 @@ async fn web_briefing(
 
     // Session summaries
     let session_summaries = store
-        .get_session_summaries_today()
+        .get_session_summaries_today(today_start)
         .map_err(map_store_error)?;
 
-    let date_str = format!(
-        "{}-{:02}-{:02}",
-        now.date().year(),
-        now.date().month(),
-        now.date().day()
-    );
+    let date_str = now
+        .with_timezone(&chrono::Local)
+        .format("%Y-%m-%d")
+        .to_string();
 
     // Top projects (limited to 5)
     let top_projects = &project_breakdown[..std::cmp::min(5, project_breakdown.len())];
@@ -3283,6 +3273,7 @@ async fn web_briefing(
         "headline": headline,
         "date": date_str,
         "period": "today",
+        "tz_offset": tz_offset,
         "metrics": {
             "sessions": {
                 "current": cur_sessions,
@@ -3357,6 +3348,7 @@ async fn cmd_web(port: u16) -> Result<()> {
     let app = Router::new()
         .route("/", get(web_index))
         .route("/assets/dashboard.css", get(web_dashboard_css))
+        .route("/assets/dashboard.util.js", get(web_dashboard_util_js))
         .route("/assets/dashboard.js", get(web_dashboard_js))
         .route("/api/stats", get(web_stats))
         .route("/api/projects", get(web_projects))
@@ -3528,9 +3520,6 @@ async fn main() -> Result<()> {
         Commands::Gc => {
             cmd_gc()?;
         }
-        Commands::Analyze { path, project } => {
-            cmd_analyze(&path, project.as_deref())?;
-        }
         Commands::Web { port } => {
             cmd_web(port).await?;
         }
@@ -3591,5 +3580,20 @@ mod tests {
         assert_eq!(api_limit(None, 20, 100), 20);
         assert_eq!(api_limit(Some(0), 20, 100), 1);
         assert_eq!(api_limit(Some(999), 20, 100), 100);
+    }
+
+    #[test]
+    fn agent_filter_parses_comma_separated_values() {
+        assert!(parse_agent_filter(None).is_empty());
+        assert!(parse_agent_filter(Some(String::new())).is_empty());
+        assert!(parse_agent_filter(Some(" , ".to_string())).is_empty());
+        assert_eq!(
+            parse_agent_filter(Some("codex".to_string())),
+            vec!["codex".to_string()]
+        );
+        assert_eq!(
+            parse_agent_filter(Some(" codex , gemini ,".to_string())),
+            vec!["codex".to_string(), "gemini".to_string()]
+        );
     }
 }

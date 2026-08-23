@@ -237,7 +237,7 @@ impl<'a> ContextAssembler<'a> {
                     }
                 }
                 let mut hot: Vec<_> = file_freq.into_iter().collect();
-                hot.sort_by(|a, b| b.1.cmp(&a.1));
+                hot.sort_by_key(|item| std::cmp::Reverse(item.1));
                 hot.iter()
                     .take(8)
                     .map(|(f, count)| format!("{f} ({count}x)"))

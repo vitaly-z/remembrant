@@ -130,7 +130,7 @@ impl std::fmt::Display for TreeNodeType {
 /// A node in the semantic tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TreeNode {
-    /// Unique ID (e.g., "project:infiniloom", "session:abc123").
+    /// Unique ID (e.g., "project:myapp", "session:abc123").
     pub id: String,
     /// Node type.
     pub node_type: TreeNodeType,

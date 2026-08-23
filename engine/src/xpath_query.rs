@@ -680,7 +680,7 @@ fn apply_predicate<'a>(
             let set_b = apply_predicate(b, set, scorer);
             // Merge, keeping best weight per node id
             let mut map: HashMap<String, (Vec<String>, &'a TreeNode, f64)> = HashMap::new();
-            for item in set_a.into_iter().chain(set_b.into_iter()) {
+            for item in set_a.into_iter().chain(set_b) {
                 let entry = map.entry(item.1.id.clone()).or_insert_with(|| item.clone());
                 if item.2 > entry.2 {
                     *entry = item;

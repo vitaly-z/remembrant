@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What Is This
 
-Remembrant is a Rust CLI tool (`rem`) that ingests AI coding agent artifacts (Claude Code, Codex CLI, Gemini CLI) into a triple-database (DuckDB + LanceDB + in-memory graph) for shared persistent memory. It features Semantic XPath queries, optional 26-language code analysis via Infiniloom, and a Tauri v2 desktop app.
+Remembrant is a Rust CLI tool (`rem`) that ingests AI coding agent artifacts (Claude Code, Codex CLI, Gemini CLI) into a triple-database (DuckDB + LanceDB + in-memory graph) for shared persistent memory. It features Semantic XPath queries and a local web dashboard/API.
 
 ## Build & Test Commands
 
@@ -25,9 +25,6 @@ cargo test -p remembrant-engine -- test_name
 # Lint and format
 cargo clippy --workspace -- -D warnings
 cargo fmt --all
-
-# Build with optional code-analysis feature (requires infiniloom sibling)
-cargo build --features code-analysis
 
 # Run the CLI locally
 cargo run --bin rem -- --help
@@ -91,12 +88,7 @@ pub async fn process<P: EmbedProvider>(provider: &P) -> Result<()> { }
 - Use `DuckStore::open_in_memory()` — no cleanup needed
 - Use `MockEmbedder` for embedding tests
 - Use `tempfile::tempdir()` for LanceDB test paths
-- Feature-gated tests: `#[cfg(feature = "code-analysis")]`
 - Never modify real agent artifact dirs (`~/.claude`, `~/.codex`, `~/.gemini`) in tests
-
-### Feature Gates
-
-`code-analysis` feature enables Infiniloom integration (AST parsing, secret scanning, BLAKE3). All related imports must be behind `#[cfg(feature = "code-analysis")]`.
 
 ### Config Paths
 
@@ -109,5 +101,4 @@ All-string interface: node kind, name, and properties are strings. Properties ar
 ## Dependencies to Note
 
 - `arrow-array`/`arrow-schema` version **must match** lancedb's arrow version (currently v57)
-- `infiniloom-engine` is a **path dependency** (`../../infiniloom/engine`) — requires the sibling repo checked out. CI symlinks it.
 - `protoc` is required at build time (for lance-encoding)

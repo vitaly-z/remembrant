@@ -3,8 +3,6 @@
 // -----------------------------------------------------------------------
 let allSessions = [];
 let currentProject = "";
-let sortField = "started_at";
-let sortAsc = false;
 let searchMode = "text";
 let activeAgents = new Set(["claude_code", "codex", "gemini"]);
 let factsActiveOnly = true;
@@ -15,13 +13,39 @@ const AGENT_COLORS = {
   codex: "#00ff9c",
   gemini: "#bc8cff",
 };
+const KNOWN_AGENTS = ["claude_code", "codex", "gemini"];
+
+// Pure helpers live in web_dashboard_util.js (unit-tested with node:test).
+const {
+  esc,
+  jsArg,
+  parseUtcDate,
+  formatIsoDay,
+  fmtNum,
+  confClass,
+  confBar,
+  safeToken,
+  trendIndicator,
+  renderSparkline,
+  describeApiError,
+  safeTime,
+  initialSliderValue,
+  confidencePayload,
+  agentQueryParams,
+  appendQuery,
+} = window.RemembrantUtil;
 
 // -----------------------------------------------------------------------
 // API helpers
 // -----------------------------------------------------------------------
 async function api(path, opts) {
   const res = await fetch("/api/" + path, opts);
-  if (!res.ok) throw new Error("API " + res.status);
+  if (!res.ok) {
+    // Preserve the server-provided error body (issue #35): a bare
+    // "API 500" gives the user nothing actionable.
+    const body = await res.text().catch(() => "");
+    throw new Error(describeApiError(res.status, body));
+  }
   return res.json();
 }
 async function apiPut(path, body) {
@@ -40,49 +64,6 @@ async function apiPost(path, body) {
 }
 async function apiDel(path) {
   return api(path, { method: "DELETE" });
-}
-function esc(value) {
-  return value
-    ? String(value)
-        .replace(/&/g, "&amp;")
-        .replace(/</g, "&lt;")
-        .replace(/>/g, "&gt;")
-        .replace(/"/g, "&quot;")
-    : "";
-}
-function jsArg(value) {
-  return String(value ?? "")
-    .replace(/\\/g, "\\\\")
-    .replace(/'/g, "\\'")
-    .replace(/"/g, "&quot;")
-    .replace(/\r/g, "\\r")
-    .replace(/\n/g, "\\n");
-}
-function parseUtcDate(value) {
-  const raw = String(value ?? "");
-  const iso = raw.includes(" ") ? raw.replace(" ", "T") : raw;
-  const hasZone = /(?:Z|[+-]\d\d:?\d\d)$/i.test(iso);
-  return new Date(hasZone ? iso : `${iso}Z`);
-}
-function formatIsoDay(value) {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value ?? ""));
-  if (!match) return String(value ?? "");
-  const months = [
-    "Jan",
-    "Feb",
-    "Mar",
-    "Apr",
-    "May",
-    "Jun",
-    "Jul",
-    "Aug",
-    "Sep",
-    "Oct",
-    "Nov",
-    "Dec",
-  ];
-  const month = months[Number(match[2]) - 1] ?? match[2];
-  return `${month} ${Number(match[3])}`;
 }
 function fmtDate(s) {
   try {
@@ -103,26 +84,6 @@ function fmtDateTime(s) {
     return esc(s || "");
   }
 }
-function fmtNum(n) {
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
-  if (n >= 1000) return (n / 1000).toFixed(1) + "k";
-  return String(n);
-}
-function confClass(c) {
-  return c >= 0.8 ? "conf-high" : c >= 0.5 ? "conf-mid" : "conf-low";
-}
-function confBar(c) {
-  const pct = Math.round(c * 100);
-  return (
-    '<span class="conf-bar"><span class="conf-track"><span class="conf-fill ' +
-    confClass(c) +
-    '" style="width:' +
-    pct +
-    '%"></span></span><span class="dim" style="font-size:10px">' +
-    pct +
-    "%</span></span>"
-  );
-}
 function agentTag(a) {
   return (
     '<span class="agent-tag agent-' +
@@ -131,11 +92,6 @@ function agentTag(a) {
     esc(a || "unknown") +
     "</span>"
   );
-}
-function safeToken(value) {
-  return String(value || "unknown")
-    .toLowerCase()
-    .replace(/[^a-z0-9_.-]/g, "-");
 }
 function memoryTags(m) {
   return Array.isArray(m.tags) && m.tags.length
@@ -155,51 +111,7 @@ function relTime(s) {
   }
 }
 
-function renderSparkline(data, color) {
-  if (!data || !data.length) return "";
-  const w = 60,
-    h = 18,
-    pad = 1;
-  const vals = data.map((d) => (typeof d === "number" ? d : d.value || 0));
-  const max = Math.max(...vals, 1);
-  const min = Math.min(...vals, 0);
-  const range = max - min || 1;
-  const pts = vals
-    .map((v, i) => {
-      const x = pad + (i / (vals.length - 1 || 1)) * (w - 2 * pad);
-      const y = h - pad - ((v - min) / range) * (h - 2 * pad);
-      return x.toFixed(1) + "," + y.toFixed(1);
-    })
-    .join(" ");
-  return (
-    '<svg width="' +
-    w +
-    '" height="' +
-    h +
-    '" viewBox="0 0 ' +
-    w +
-    " " +
-    h +
-    '"><polyline points="' +
-    pts +
-    '" fill="none" stroke="' +
-    (color || "var(--accent)") +
-    '" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>'
-  );
-}
 
-function trendIndicator(current, previous) {
-  if (previous === 0 && current === 0)
-    return '<span class="trend trend-flat">&rarr; steady</span>';
-  if (previous === 0) return '<span class="trend trend-up">&uarr; new</span>';
-  const pct = Math.round(((current - previous) / previous) * 100);
-  if (pct > 0) return '<span class="trend trend-up">&uarr; ' + pct + "%</span>";
-  if (pct < 0)
-    return (
-      '<span class="trend trend-down">&darr; ' + Math.abs(pct) + "%</span>"
-    );
-  return '<span class="trend trend-flat">&rarr; steady</span>';
-}
 
 async function loadBriefing() {
   try {
@@ -633,6 +545,7 @@ async function loadHomeActivity() {
     let dUrl = "decisions";
     if (currentProject)
       dUrl += "?project=" + encodeURIComponent(currentProject);
+    dUrl = appendQuery(dUrl, agentQueryParams(activeAgents, KNOWN_AGENTS));
     let decisions = await api(dUrl);
     let dEl = document.getElementById("homeDecisionsContent");
     let recent = decisions.slice(0, 5);
@@ -667,20 +580,6 @@ async function loadHomeActivity() {
     document.getElementById("homeDecisionsContent").innerHTML =
       '<div class="empty-state" style="padding:20px"><div class="empty-text">Could not load decisions</div></div>';
   }
-}
-
-function sortBy(field) {
-  if (sortField === field) sortAsc = !sortAsc;
-  else {
-    sortField = field;
-    sortAsc = true;
-  }
-  allSessions.sort((a, b) => {
-    const av = a[field] || "",
-      bv = b[field] || "";
-    return sortAsc ? (av > bv ? 1 : -1) : av < bv ? 1 : -1;
-  });
-  renderSessions(allSessions);
 }
 
 async function showDetail(id) {
@@ -733,9 +632,9 @@ async function showDetail(id) {
         ")</label>";
       tcs.slice(0, 50).forEach((tc) => {
         const cls = tc.success === false ? " failed" : "";
-        const ts = tc.timestamp
-          ? parseUtcDate(tc.timestamp).toLocaleTimeString()
-          : "";
+        // safeTime never throws: a malformed timestamp degrades to ""
+        // instead of blanking the whole modal (issue #35).
+        const ts = safeTime(tc.timestamp);
         html +=
           '<div class="tool-call-item' +
           cls +
@@ -779,6 +678,7 @@ async function loadMemories() {
   try {
     let url = "memories?limit=200";
     if (currentProject) url += "&project=" + encodeURIComponent(currentProject);
+    url = appendQuery(url, agentQueryParams(activeAgents, KNOWN_AGENTS));
     const memories = await api(url);
     if (!memories.length) {
       el.innerHTML =
@@ -796,8 +696,10 @@ async function loadMemories() {
         const d = m.created_at ? fmtDate(m.created_at) : "";
         const conf = typeof m.confidence === "number" ? m.confidence : 1.0;
         return (
-          '<div class="memory-card" id="mem-' +
+          '<div class="memory-card" data-memory-id="' +
           esc(m.id) +
+          '" data-confidence="' +
+          esc(String(conf)) +
           '" data-tags="' +
           esc((m.tags || []).join(", ")) +
           '">' +
@@ -836,12 +738,19 @@ async function loadMemories() {
 
 async function editMemory(id, ev) {
   ev.stopPropagation();
-  const card = document.getElementById("mem-" + id);
-  if (card.querySelector(".edit-form")) return;
-  const body = card.querySelector(".card-body");
-  const current = body.textContent;
+  // Locate the card from the clicked button — never via string-built DOM ids
+  // (issue #35): ids containing HTML-special characters used to mismatch.
+  const card = ev.currentTarget.closest(".memory-card");
+  if (!card || card.querySelector(".edit-form")) return;
+  const current = card.querySelector(".card-body").textContent;
+  // Initialize the slider from the memory's CURRENT confidence (issue #27):
+  // it used to be hardcoded to 80, silently resetting confidence on save.
+  const currentConfidence = Number(card.dataset.confidence);
+  const initial = initialSliderValue(currentConfidence);
   const form = document.createElement("div");
   form.className = "edit-form";
+  form.dataset.initialConfidence = String(initial);
+  form.dataset.currentConfidence = String(card.dataset.confidence ?? "");
   form.innerHTML =
     "<textarea>" +
     esc(current) +
@@ -849,26 +758,36 @@ async function editMemory(id, ev) {
     '<input type="text" class="tag-input" value="' +
     esc(card.dataset.tags || "") +
     '" placeholder="tags (comma-separated)" style="width:calc(100% - 22px);margin-top:6px;background:var(--bg-primary);border:1px solid var(--border);color:var(--text-primary);padding:7px;border-radius:4px;font-family:inherit;font-size:11px" />' +
-    '<div class="edit-row"><span style="font-size:10px;color:var(--text-dim)">confidence:</span><input type="range" min="0" max="100" value="80" id="confSlider-' +
-    id +
-    '"><span id="confVal-' +
-    id +
-    '" style="font-size:10px;color:var(--text-dim);width:30px">80%</span></div>' +
-    '<div style="display:flex;gap:6px;justify-content:flex-end;margin-top:8px"><button class="btn btn-sm btn-ghost" onclick="this.closest(\'.edit-form\').remove()">cancel</button><button class="btn btn-sm" onclick="saveMemory(\'' +
-    esc(id) +
-    "',this)\">save</button></div>";
+    '<div class="edit-row"><span style="font-size:10px;color:var(--text-dim)">confidence:</span><input type="range" min="0" max="100" value="' +
+    initial +
+    '"><span class="conf-val" style="font-size:10px;color:var(--text-dim);width:30px">' +
+    initial +
+    "%</span></div>" +
+    '<div style="display:flex;gap:6px;justify-content:flex-end;margin-top:8px"><button class="btn btn-sm btn-ghost cancel-edit">cancel</button><button class="btn btn-sm save-edit">save</button></div>';
   card.appendChild(form);
   const slider = form.querySelector("input[type=range]");
-  const valEl = form.querySelector("[id^=confVal]");
-  slider.oninput = () => {
+  const valEl = form.querySelector(".conf-val");
+  slider.addEventListener("input", () => {
     valEl.textContent = slider.value + "%";
-  };
+  });
+  form.querySelector(".cancel-edit").addEventListener("click", () => form.remove());
+  form.querySelector(".save-edit").addEventListener("click", (e) => {
+    saveMemory(id, e.currentTarget);
+  });
 }
 
 async function saveMemory(id, btn) {
   const form = btn.closest(".edit-form");
   const content = form.querySelector("textarea").value;
-  const conf = parseInt(form.querySelector("input[type=range]").value) / 100;
+  const sliderValue = parseInt(form.querySelector("input[type=range]").value, 10);
+  const initial = parseInt(form.dataset.initialConfidence ?? "80", 10);
+  const currentConfidence =
+    form.dataset.currentConfidence !== ""
+      ? Number(form.dataset.currentConfidence)
+      : undefined;
+  // Preserve the stored confidence exactly unless the user moved the slider
+  // (issue #27).
+  const conf = confidencePayload(currentConfidence, initial, sliderValue);
   const tags = (form.querySelector(".tag-input").value || "")
     .split(",")
     .map((tag) => tag.trim())
@@ -903,8 +822,9 @@ async function loadFacts() {
   const el = document.getElementById("factsContent");
   el.innerHTML = '<div class="loading-state">loading</div>';
   try {
-    const url = "facts?limit=200&active_only=" + factsActiveOnly;
+    let url = "facts?limit=200&active_only=" + factsActiveOnly;
     if (currentProject) url += "&project=" + encodeURIComponent(currentProject);
+    url = appendQuery(url, agentQueryParams(activeAgents, KNOWN_AGENTS));
     const facts = await api(url);
     document.getElementById("factsCount").textContent =
       "(" + facts.length + ")";
@@ -1038,6 +958,7 @@ async function loadDecisions() {
   try {
     let url = "decisions";
     if (currentProject) url += "?project=" + encodeURIComponent(currentProject);
+    url = appendQuery(url, agentQueryParams(activeAgents, KNOWN_AGENTS));
     const decisions = await api(url);
     if (!decisions.length) {
       el.innerHTML =
@@ -1401,7 +1322,27 @@ function toggleAgent(el, agent) {
   el.classList.toggle("active");
   if (activeAgents.has(agent)) activeAgents.delete(agent);
   else activeAgents.add(agent);
-  renderSessions(allSessions);
+  applyFiltersToActiveTab();
+}
+
+// Re-query whichever tab is currently visible so the agent chips and the
+// project filter affect every view, not just Sessions (issue #28).
+function applyFiltersToActiveTab() {
+  const activePanel = document.querySelector(".tab-content.active");
+  const tab = activePanel ? activePanel.id.replace(/Panel$/, "") : "home";
+  if (tab === "sessions") {
+    // Re-fetch: the cached rows were scoped to the previous project filter.
+    loadSessions(currentProject);
+  } else if (tab === "memories") {
+    loadMemories();
+  } else if (tab === "facts") {
+    loadFacts();
+  } else if (tab === "decisions") {
+    loadDecisions();
+  } else if (tab === "home") {
+    loadHomeActivity();
+  }
+  // analytics/search have no agent or project dimension.
 }
 
 async function performSearch() {
@@ -1653,6 +1594,9 @@ document.getElementById("cmdInput").addEventListener("keydown", (e) => {
   if (e.key === "Escape") closeCmdPalette();
   if (e.key === "Enter") {
     const val = e.target.value.trim().toLowerCase();
+    // Empty input is a no-op (issue #35): it used to jump to Home because
+    // every tab name starts with the empty string.
+    if (!val) return;
     const tabs = [
       "home",
       "sessions",
@@ -1682,7 +1626,7 @@ document.querySelectorAll(".modal-overlay").forEach((m) =>
 
 document.getElementById("projectFilter").addEventListener("change", (e) => {
   currentProject = e.target.value;
-  loadSessions(currentProject);
+  applyFiltersToActiveTab();
 });
 
 // -----------------------------------------------------------------------
