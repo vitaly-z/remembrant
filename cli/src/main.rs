@@ -1414,7 +1414,7 @@ fn cmd_brief(project: Option<&str>, today: bool, json_output: bool) -> Result<()
         println!("  (none)");
     } else {
         let mut sorted: Vec<_> = project_counts.iter().collect();
-        sorted.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+        sorted.sort_by_key(|item| std::cmp::Reverse(item.1.0));
         for (proj, (count, _, _)) in &sorted {
             let label = if *count == 1 { "session" } else { "sessions" };
             println!("  - {proj} ({count} {label})");
@@ -1684,7 +1684,7 @@ fn cmd_patterns(topic: Option<&str>) -> Result<()> {
 
     // Sort by number of projects (descending)
     let mut sorted: Vec<_> = pattern_groups.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.0.len().cmp(&a.1.0.len()));
+    sorted.sort_by_key(|item| std::cmp::Reverse(item.1.0.len()));
 
     println!("Cross-Project Patterns:\n");
     for (content, (projects, first_seen)) in &sorted {
